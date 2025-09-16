@@ -1,0 +1,17 @@
+# Toolchain artefacts
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.out
+*.lst
+
+# Build directories
+/build/
+firmware/build/
+
+# User specific
+.DS_Store
