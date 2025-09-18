@@ -1,110 +1,124 @@
-**Whisker Breeze — 软硬件设计文档（v0.1 草案）**
+# Whisker Breeze Hardware and Firmware Design Specification
 
-- **MCU**: `CH32V003F4U6`（RISC‑V，WCH）
-- **项目代号**: Whisker Breeze
-- **固件栈**: `ch32fun` + C（见 `firmware/`）
-- **当前固件入口**: `firmware/whisker_breeze.c`
+## System Overview
 
-—喵，心羽把连线都老老实实记下来了；你新补充的约束我已同步进表，并把仍需你确认的细节保留成填空项，方便继续推进。—
+- **Microcontroller**: CH32V003F4U6 (RISC-V, WCH)
+- **Project Codename**: Whisker Breeze
+- **Firmware Stack**: ch32fun HAL with application firmware in C (`firmware/`)
+- **Current Firmware Entrypoint**: `firmware/whisker_breeze.c`
+- **Primary Power Domain**: 3V3 rail with local decoupling (C3 1 µF and C4 100 nF placed close to VDD/VSS)
+- **Clock Source**: Internal RC oscillator; PA1 is repurposed for SSD1306 VBAT control and PA2 serves as an analog input; no external crystal is populated
+- **Programming and Debug**: PD1/SWIO single-wire debug interface with PD7/NRST reset pin
+- **Primary Peripherals**: I2C bus (SSD1306, INA226, CH224Q interrupt), PWM fan drive, discrete mode inputs, power good monitoring; UART is reserved but disabled by default
 
-**概览**
+## Power and Clock Distribution
 
-- **供电**: `3V3` 轨；去耦就近布置 `C3 1µF` + `C4 100nF`（图左）。
-- **时钟**: 使用内部 RC；`PA1` 被复用为 SSD1306 VBAT 开关控制，`PA2` 作模拟输入，未连接外部晶振。
-- **调试/下载**: `PD1/SWIO` 单线调试；`PD7/NRST` 复位脚。
-- **主要外设**: I2C（SSD1306 显示/外设中断 `INT`）、PWM（风扇）、若干模式输入与电源状态输入；UART 暂不使用。
+- SSD1306 VBAT is switched through a PMOS controlled by PA1 (`BAT`). Confirm gate polarity and any necessary inrush limiting.
+- TPS22810DBVR load switch on PC5 (`FAN_EN`) gates the 5 V fan supply. EN/UVLO is active high and must not float. With CT = 2.2 nF and VIN = 5 V, RL = 10 Ω, the measured 10–90% rise time is ~0.2 ms. Firmware should assert FAN_EN for ≥1 ms before enabling PWM and deassert it when duty cycle returns to 0% so the internal QOD discharges the load.
+- Internal RC oscillator provides the system clock; no external crystal is populated.
 
-**GPIO 与网络标号对照表（按原理图片面直读记录）**
+## Peripheral Interfaces
 
-- `PD7/NRST/T2CH4` ←→ `NRST`
-- `PA1/OSCI/A1` ←→ `BAT`（SSD1306 VBAT 开关控制，驱动 PMOS 栅极）
-- `PA2/OSCO/A0/T1CH2N` ←→ `TS`（温度或热敏采样，ADC 通道，前端待补充）
-- `VSS` ←→ 数字地（GND）
-- `PD0/T1CH1N/OPN1` ←→ `RES`（SSD1306 屏幕复位）
-- `VDD` ←→ `3V3`
-- `PC0/T2CH3/UTX_` ←→ `INT`（外设中断，板上无状态 LED）
-- `PC1/SDA/NSS/T2CH4` ←→ `SDA`（I2C 数据）
-- `PC2/SCL/URTS/T1BKIN` ←→ `SCL`（I2C 时钟）
-- `PC3/T1CH3/T1CH1N_` ←→ `FAN_PWM`（风扇 PWM 输出，预计使用 `TIM1 CH3`）
-- `PC4/A2/T1CH4/MCO` ←→ `FAN_TACH`（风扇测速/霍尔回传，EXTI4 触发 + TIM2 自由运行计数器，内部上拉）
-- `PC5/SCK/T1ETR/T2CH1` ←→ `FAN_EN`
-- `PC6/MOSI/T1CH1N_` ←→ 空闲（可后续复用）
-- `PC7/MISO/T1CH2_` ←→ `VBUS_PG`（来自 CH224Q，PG 脚典型为开漏输出，需上拉；有效电平待确认型号）
-- `PD1/SWIO/AETR2` ←→ `PD1`（网络标号同名，推断为保留给 SWIO；请确认是否亦作 GPIO）
-- `PD2/A3/T1CH1/T2CH3` ←→ `FAST`（模式输入）
-- `PD3/A4/T2CH2/AETR` ←→ `MODE`（模式输入）
-- `PD4/A7/UCK/T2CH1ETR` ←→ `SLOW`（模式输入）
-- `PA5/UTX` ←→ `TX`（UART 发送，暂未使用）
-- `PD5/URX` ←→ `RX`（UART 接收，暂未使用）
+### Display Power and Reset
 
-备注：板右下角的双线端子丝印为 `FAN_EN`、`FAN_TACH`，已确认分别对应 MCU `PC5`、`PC4`。
+- SSD1306 reset (`RES`) is driven by PD0. VBAT switching is handled by PA1. The display uses I2C address 0x3C. A reset pulse of ≥3 µs with active-low polarity is required. Firmware should probe the display and gracefully skip display updates when absent.
 
-说明：以上完全按提供的图片丝印与网络标号直读记录；凡无法 100% 确认之处均未武断推断，并在“待补充”列出。
+### Fan Drive and Tachometer
 
-**硬件设计要点**
+- PWM output on PC3 (`TIM1_CH3`) should operate at 20–30 kHz to remain above audible range. Firmware applies a 0–100 ms linear ramp at power-on and then tracks the mode-derived target duty cycle.
+- Tachometer input on PC4 captures open-drain pulses (two pulses per revolution typical). The pin is internally pulled up to 3V3, EXTI4 triggers on falling edges, and TIM2 free-running at 100 kHz (PSC = 479) measures the interval. Missing pulses for ≥500 ms invalidate RPM feedback. Readings above 4500 RPM or sudden drops below 300 RPM when the target duty is high are discarded as glitches. If duty > 0 and RPM remains 0, firmware increments the minimum duty baseline (default 100 RPM equivalent, capped at 20 000 RPM).
 
-- **去耦布置**: `C3 1µF` + `C4 100nF` 贴近 `VDD` 与 `VSS`，优先走最短回流路径。
-- **电源门控**: `BAT` 由 `PA1` 控制 SSD1306 的 VBAT PMOS 开关；需确认栅极驱动极性与限流。
-- **风扇负载开关**: `PC5/FAN_EN` 驱动 TI TPS22810DBVR 正向负载开关，EN/UVLO 高有效，脚位不能悬空；依据 datasheet 的 CT=2.2 nF 示范，10–90% 上升时间约 0.2 ms (VIN=5 V、RL=10 Ohm)，固件在拉高后等待 >=1 ms 再输出 PWM，占空降至 0% 时拉低以借助 QOD 快速泄放。实测同款风扇为标准 4 线特性——占空比越高，转速越快；固件按此线性映射占空比。
-- **风扇测速**: `PC4/FAN_TACH` 内部上拉至 3V3；PC 机箱常见的 3 线/4 线风扇会在测速线上输出 2 脉冲/转，固件据此换算真实转速。霍尔开漏信号由 `EXTI4` 下降沿触发采样，后台用 `TIM2` 自由运行的 100 kHz（PSC=479）计数器计算脉冲间隔，并通过 `__attribute__((interrupt))` 声明确保中断处理不会被优化器剥离。若 500 ms 未出现脉冲，则判定测速失效并清零 RPM；单次读数若高于 4500 RPM，或在目标占比较高时突然跌到 300 RPM 以下，会被视为毛刺忽略，避免极值记录被污染。
-- **电流/功率监测**: INA226（I2C 地址焊接为 `0x44`，7-bit）挂在 I2C1，总线 0–36 V 共模、2.7–5.5 V 供电；固件每 200 ms 轮询一次电压、电流与功率并写入日志，并在启动时自动扫描 `0x40–0x4F` 以确认实际地址。板载分流电阻 10 mΩ 已在校准常数中使用。由于 INA226 在无需 HS 握手的快模式上限为 400 kHz，I2C1 统一降速至 400 kHz 以确保与 INA226、CH224Q 共存；同时其母线寄存器 ≥约 11.5 V（RAW ≥9200）时，会强制把 `12` 标志视为有效，即便 CH224Q 未成功协商 PD 档位，也能可靠反映真实供电。
-- **ADC**: `TS` 接至 `PA2(A0)`；保留外置 NTC 分压网络（10 kΩ @25°C、β=3950，3V3 通过 8.2 kΩ 上拉），当前 MVP 阶段暂未启用，固件按手动模式运行。
-- **I2C**: `PC1/PC2` 用于 SSD1306（I2C）、INA226 与 CH224Q；`INT` 由 `PC0` 承担；上拉阻值待确认。总线速率固定为 400 kHz（Fast Mode），兼容 INA226 的应答规范。
-- **PWM**: `PC3` → `TIM1_CH3` 建议 PWM 频率 20–30 kHz（避开可闻噪声）；上电 0–100 ms 线性爬升后回到拨轮设定占空。
-- **UART**: `PA5(TX)`、`PD5(RX)` 保留但暂不启用（固件默认关闭日志/printf）。
-- **下载/调试**: 保留 `PD1/SWIO`、`PD7/NRST` 接线/测试点；避免被外设硬拉电平影响。
+### Current and Power Monitoring
 
-**软件架构**
+- INA226 is connected on I2C address 0x44 (7-bit). Shared bus speed is fixed at 400 kHz to satisfy INA226 and CH224Q timing. The shunt resistor is 10 mΩ. Firmware polls bus voltage, shunt current, and power every 200 ms and records results in the heartbeat log. Startup includes scanning 0x40–0x4F to confirm the active address. INA226 bus voltage readings ≥ ~11.5 V (RAW ≥ 9200) force the `12` status bit to true to indicate valid high-voltage input even if CH224Q negotiation fails.
 
-- **启动**: `SystemInit()` → 外设与 GPIO 初始化 → 主循环。
-- **模块划分**:
-  - **board**: 管脚/时钟/中断优先级与 `funGpioInitAll()` 封装。
-  - **drivers.uart**: 串口 printf/日志、命令行（可选）。
-  - **drivers.i2c**: I2C1 总线初始化与共享访问（SSD1306、CH224Q 等），`INT` 中断回调预留。
-  - **drivers.display**: SSD1306 I2C 驱动与绘图基元；上电时先探测是否存在，缺省可跳过显示逻辑；复位脚 `RES` 与 VBAT 开关 `BAT` 控制。
-  - **drivers.pd**: CH224Q PD Sink 协议处理，请求 12 V 档位并监测 PG / PD 状态。
-  - **drivers.pwm**: `TIM1_CH3` 占空控制。
-  - **drivers.adc**: 通道轮询采样逻辑暂不启用，保留接口以便后续恢复温控。
-  - **app.modes**: `SLOW/MODE/FAST` 拨轮转换为速控输入（平滑插值）。
-  - **app.fan**: 拨轮输出 0~100% 的目标“转速比例”，线性映射到 PWM 占空（最低 10%，最高 100%）；上电 100 ms 软启动后进入闭环调节。`EXTI4` 的下降沿驱动 TIM2 计数差得到实时 RPM，若检测到目标占比 >0 但转速仍为 0，则动态提高最小转速基准（默认 100 RPM，上限 20000 RPM）。
-  - **app.power**: `VBUS_PG` 监测、欠压/掉电管理；调用 INA226 采样总线电压/电流并在日志心跳里输出，供调速与供电验证。
-- **日志**: UART 暂不使用；保留可编译开关，后续需要时开启。
-  - 控制台心跳日志字段简化为：`p`（风扇相位，0=软启动/1=运行）、`t`（目标比例 %）、`d`（当前占空 %）、`r`（RPM 取整）、`v`（VBUS 存在标志）、`12`（12 V 是否有效）、`b`（INA226 母线原始寄存器）、`i`（电流估算 mA）、`c`（TIM1 CH3 比较寄存器值）、`k`（按键原始/去抖掩码）。
-  - 固件上电后自动执行满速标定：拨轮输入暂时被忽略，确认 `12=1`（PD 协商或 INA226 电压判断任一满足即可）后至少运行 2 s 且连续 500 ms 未再提升 RPM 时打印 `[cal]rpm/tgt`，随后退回“10% 峰值或 ≥100 RPM（二选一）”继续运行；PD 掉线或 VBUS 断电会自动重置标定流程。
+### USB Power Delivery Monitor
 
-**时序与参数建议（待确认后落表）**
+- CH224Q power-good output (`VBUS_PG` on PC7) is open-drain with active-low polarity and requires an external pull-up. The current design uses 100 kΩ to 3V3. Firmware monitors this signal for PD negotiation status and power-loss handling.
 
-- **PWM 频率**: `20 kHz`（建议 20–30kHz），上电 0–100 ms 线性爬升，再按拨轮选择的目标占空运行。
-- **ADC 采样周期**: `暂未启用（保留 200 ms 配置，待温控功能恢复）`。
-- **UART 波特率**: `未使用`
-- **模式输入有效电平**: `SLOW 低有效`（按住持续减速） / `MODE 低有效`（保留，可作停靠） / `FAST 低有效`（按住持续加速）
-- **VBUS_PG 有效电平**: `低电平有效`（CH224Q 的 PG 多为开漏，需上拉；有效极性请确认所用子型号）
+### Mode and Configuration Inputs
 
-**固件与硬件一致性调整**
+- PD2 (`FAST`), PD3 (`MODE`), and PD4 (`SLOW`) are low-active inputs sourced from a TM-2024A multi-position switch. Each input enables internal pull-ups (~47 kΩ). Hardware omits RC filtering; firmware applies ≥5 ms debounce.
 
-- 取消状态 LED：板上无 LED，移除固件中 `STATUS_LED`=PC0 的定义与心跳翻转逻辑；PC0 仅作 `INT`。
-- UART 默认关闭：保持接口保留但不初始化/不打印。
-- I2C 共享：I2C1 同时服务 SSD1306 与 CH224Q；固件开机会统一初始化并根据设备是否应答选择启用功能。
+### UART Reserve
 
-**硬件/原理图待补充清单（填空题）**
+- PA5 (`TX`) and PD5 (`RX`) are reserved for UART logging and remain disabled unless explicitly enabled.
 
-1) `TS` 前端参数（按图）：若为 NTC，阻值 `10 kΩ@25°C`、β 值 `3950`、参考分压/激励 `3V3 通过 8.2 kΩ 上拉`；采样 RC `≈0.55 ms（8.2 kΩ ∥ 10 kΩ 配 100 nF）`。
-2) `INT` 来源与有效极性：来源器件 `INA226`；有效电平 `低`；是否需上拉 `是`，阻值 `4.7 kΩ`。
-3) I2C 上拉：`SDA/SCL` 上拉阻值 `4.7 kΩ`，电压域 `3V3`。
-4) SSD1306 细节：I2C 地址 `0x3C`；`RES` 有效电平 `低/高`（通常为低有效），复位脉宽 `≥3 µs`。
-5) `SLOW/MODE/FAST`：低有效，使用 TM-2024A 四脚两档/按压开关，`C` 脚接 `GND`，`1`/`2` 脚分别接 MCU 的模式输入并使能内部上拉（≈`47 kΩ` @3V3，`T` 脚可保留作按压检测或悬空）；硬件不加电容，固件以 ≥`5 ms` 的软件去抖窗口滤除机械抖动。
-6) `VBUS_PG`（CH224Q）：PG 脚是否开漏 `是`；上拉到 `3V3`，阻值 `100 kΩ`；有效极性 `低`。
-7) 系统时钟来源：`内部 RC`。
+## GPIO Assignment
 
-**测试与验证建议**
+| MCU Pin | Net Label | Function | Notes |
+| --- | --- | --- | --- |
+| PD7/NRST/T2CH4 | NRST | External reset | Dedicated reset input |
+| PA1/OSCI/A1 | BAT | SSD1306 VBAT switch control | Drives PMOS gate |
+| PA2/OSCO/A0/T1CH2N | TS | Thermal sense input | ADC channel; external front-end pending |
+| VSS | GND | Digital ground | Reference plane |
+| PD0/T1CH1N/OPN1 | RES | SSD1306 reset | Active low |
+| VDD | 3V3 | Supply | Primary rail |
+| PC0/T2CH3/UTX_ | INT | Peripheral interrupt | Shared interrupt line |
+| PC1/SDA/NSS/T2CH4 | SDA | I2C data | 4.7 kΩ pull-up to 3V3 |
+| PC2/SCL/URTS/T1BKIN | SCL | I2C clock | 4.7 kΩ pull-up to 3V3 |
+| PC3/T1CH3/T1CH1N_ | FAN_PWM | PWM output | TIM1 CH3 |
+| PC4/A2/T1CH4/MCO | FAN_TACH | Fan tachometer | EXTI4, internal pull-up |
+| PC5/SCK/T1ETR/T2CH1 | FAN_EN | Load switch enable | Controls TPS22810 |
+| PC6/MOSI/T1CH1N_ | — | Reserved | Available for future use |
+| PC7/MISO/T1CH2_ | VBUS_PG | Power-good from CH224Q | Open-drain, active low |
+| PD1/SWIO/AETR2 | PD1 | SWIO debug | Confirm availability for GPIO reuse if needed |
+| PD2/A3/T1CH1/T2CH3 | FAST | Mode input | Low-active |
+| PD3/A4/T2CH2/AETR | MODE | Mode input | Low-active |
+| PD4/A7/UCK/T2CH1ETR | SLOW | Mode input | Low-active |
+| PA5/UTX | TX | UART TX | Disabled by default |
+| PD5/URX | RX | UART RX | Disabled by default |
 
-- 上电自检：打印版本、电源状态与 PD 档位，确认转速反馈正常。
-- 模式输入：三路开关去抖验证与状态机切换。
-- PWM：验证拨轮全行程（10%~100% 连续输出）与听感；同步检查 `FAN_TACH` 的转速反馈。
-- I2C：SSD1306 初始化/刷新验证；外设 `INT` 触发路径验证。
-- 下载与复位：`SWIO/NRST` 独立可用，不受外设硬拉干扰。
+## Firmware Architecture
 
-**文件与代码位置**
+- **Startup Sequence**: `SystemInit()` configures clocking, peripheral clocks, and GPIO before entering the main loop.
+- **Module Responsibilities**:
+  - `board`: Consolidates pin, clock, and interrupt priority setup via `funGpioInitAll()`.
+  - `drivers.i2c`: Initializes the shared I2C1 bus and arbitrates access for SSD1306, INA226, and CH224Q, including interrupt callback placeholders on PC0.
+  - `drivers.display`: Handles SSD1306 initialization, reset sequencing, VBAT control, and basic graphics primitives with presence detection.
+  - `drivers.pd`: Implements CH224Q sink negotiation, requests 12 V operation, and tracks PG/PD status.
+  - `drivers.pwm`: Controls TIM1 CH3 duty cycle generation.
+  - `drivers.adc`: Provides channel polling scaffolding (currently disabled pending thermal sensing enablement).
+  - `drivers.uart`: Maintains optional UART logging and command interface (compile-time disabled).
+  - `app.modes`: Translates SLOW/MODE/FAST inputs into normalized setpoints with interpolated smoothing.
+  - `app.fan`: Executes soft-start, duty-cycle regulation, RPM computation via EXTI4/TIM2, and fault handling (RPM stalls, outliers).
+  - `app.power`: Monitors VBUS_PG, aggregates INA226 telemetry, and publishes power-state information to the heartbeat log.
+- **Logging**: UART logging remains disabled. When enabled, the heartbeat includes: `p` (phase), `t` (target %), `d` (duty %), `r` (RPM), `v` (VBUS presence flag), `12` (12 V status), `b` (INA226 bus register raw), `i` (current in mA), `c` (TIM1 CH3 compare value), `k` (debounced switch state).
+- **Calibration**: On power-up, firmware performs a full-speed calibration after confirming `12 = 1`. After ≥2 s of stable operation (500 ms without RPM increase), it logs `[cal]rpm/tgt` and reverts to the greater of 10% duty or 100 RPM equivalent. Loss of PD or VBUS resets calibration.
 
-- 入口：`firmware/whisker_breeze.c`
-- LED：板上无；固件需移除此定义与相关逻辑。
+## Operating Parameters
+
+- PWM frequency: 20 kHz nominal (acceptable range 20–30 kHz).
+- Soft-start: linear ramp from 0% to target over 0–100 ms after FAN_EN assertion.
+- ADC sampling: infrastructure reserved; intended 200 ms cadence when thermal sensing is enabled.
+- UART baud rate: unused.
+- Mode input polarity: active low; confirm pull-ups enabled on PD2/PD3/PD4.
+- VBUS_PG polarity: active low via CH224Q open-drain with external pull-up.
+
+## Configuration Alignment
+
+- Status LED support is removed; PC0 is strictly allocated to the shared interrupt line.
+- UART initialization is suppressed unless explicitly required.
+- I2C1 initialization accounts for all connected devices and enables only the features acknowledged during startup.
+
+## Outstanding Information Required
+
+1. Finalize the TS input front-end: confirm NTC value (10 kΩ @ 25 °C), β = 3950, bias network (3V3 via 8.2 kΩ), and any RC filtering (≈0.55 ms with 100 nF).
+2. Verify INT source device, polarity (low-active), and pull-up value (4.7 kΩ to 3V3).
+3. Confirm SSD1306 reset polarity (expected active low) and timing.
+4. Validate TM-2024A wiring for SLOW/MODE/FAST, including optional press detection and pull-up strategy.
+5. Confirm CH224Q PG pull-up implementation (100 kΩ to 3V3) and effective voltage thresholds.
+6. Assess reuse eligibility for PD1 when SWIO is not in use.
+
+## Verification Checklist
+
+- Power-on self-test: verify firmware banner, VBUS status, PD negotiation, and fan RPM reporting.
+- Mode input exercise: confirm debounce behavior and PWM scaling across SLOW/MODE/FAST positions.
+- PWM sweep: validate audible performance across 10%–100% duty and correlate tachometer feedback.
+- I2C validation: confirm SSD1306 initialization and interrupt handling for INA226/CH224Q.
+- Programming interface: ensure SWIO/NRST accessibility without interference from adjacent circuitry.
+
+## Reference Files
+
+- Firmware entry: `firmware/whisker_breeze.c`
+- Hardware notes repository: `docs/`

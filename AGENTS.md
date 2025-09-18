@@ -2,38 +2,34 @@
 
 ## Project Structure & Module Organization
 
-- `firmware/` holds the application sources, CH32 target configuration, and the primary `Makefile`. Build artefacts (`.elf`, `.hex`, `.bin`, `.map`) are generated here; keep the directory clean before committing.
-- `ch32fun/` is a git submodule supplying the hardware abstraction, build scripts, and `minichlink` flashing utility. Run `git submodule update --init` after cloning and before updating toolchain files.
-- `docs/` stores wiring notes, display datasheets, and ancillary design material. Update these when introducing new hardware modes or peripherals.
+- `firmware/` hosts CH32 application sources, board configuration, and the primary `Makefile`; generated artefacts (`*.elf`, `*.bin`, `*.hex`, `*.map`) should be cleaned before committing.
+- `ch32fun/` is a git submodule delivering the hardware abstraction layer, build scripts, and the `minichlink` utility—run `git submodule update --init --recursive` after cloning or when toolchain files change.
+- `docs/` captures wiring notes, display datasheets, and hardware experiments; update it whenever peripherals, pin maps, or measurement procedures evolve.
+- The repository root `Makefile` proxies to `make -C firmware`; prefer it for quick builds from the top level.
 
 ## Build, Test, and Development Commands
 
-```sh
-make            # build + flash via firmware/Makefile (shortcut to `make -C firmware flash`)
-make flash      # rebuild firmware and program the board with minichlink
-make clean      # remove firmware artefacts to guarantee full rebuilds
-make attach     # open a persistent minichlink session for interactive debugging
-```
-
-Ensure `riscv64-unknown-elf-gcc` (or another supported prefix) is on your `PATH`, and export `MINICHLINK` if using a non-default location.
+- `make` — rebuilds the firmware and flashes it via `minichlink`; equivalent to `make -C firmware flash`.
+- `make flash` — forces a firmware rebuild before programming the board; use after code or linker changes.
+- `make clean` — removes artefacts in `firmware/` to guarantee a pristine rebuild.
+- `make attach` — opens a persistent `minichlink` debug session for interactive inspection.
+- Confirm `riscv64-unknown-elf-gcc` is on `PATH`, and export `MINICHLINK` if using a custom binary location.
 
 ## Coding Style & Naming Conventions
 
-- C sources follow the repository `.clang-format` (Allman braces, 4-space alignment, 120-column limit). Run `clang-format -i <file.c>` before committing.
-- Use `snake_case` for functions and variables, uppercase for hardware macros and constants (`PIN_DISPLAY_PWR`, `FAN_PWM_PERIOD_TICKS`).
-- Keep hardware bindings grouped at the top of each module and document new GPIO assignments inline.
+- Follow the repository `.clang-format`: Allman braces, 4-space indentation, 120-character lines.
+- Adopt `snake_case` for functions and variables, while hardware macros and constants remain uppercase (e.g., `PIN_DISPLAY_PWR`).
+- Group GPIO bindings and hardware notes at the top of each module; annotate non-obvious timing or register decisions inline.
+- Run `clang-format -i <file.c>` before committing to keep diffs minimal.
 
 ## Testing Guidelines
 
-Automated unit tests are not yet defined. Exercise new logic on hardware after every significant change: power-cycle the board, verify PWM ramp behaviour, and watch the UART heartbeat for regressions. Note observed RPM, duty-cycle, and I²C status when filing issues.
+- Automated unit tests are not defined; validate changes on hardware after every significant edit.
+- Power-cycle the board, observe PWM ramp behaviour, and monitor UART heartbeat logs for regressions.
+- Capture scope traces or RPM readings when behaviour changes, and document them in issues or PR descriptions.
 
 ## Commit & Pull Request Guidelines
 
-- Follow Conventional Commits (`feat:`, `fix:`, `docs:`) as seen in the git history.
-- Reference related issues, summarize hardware verification steps (e.g., "Tested on CH32V003 @ 20 kHz PWM"), and attach scope captures or photos when behaviour changes.
-- Keep PRs focused; coordinate breaking register-map changes with maintainers before merging.
-
-## Tooling & Dependency Tips
-
-- Update submodules with `git submodule update --remote --merge` when syncing to upstream ch32fun.
-- Pin your compiler version in the PR description when introducing toolchain-dependent changes to ease reviewer reproduction.
+- Write Conventional Commits (`feat:`, `fix:`, `docs:`) that describe the firmware-level impact.
+- PRs should summarise verification steps (e.g., "Tested on CH32V003 @ 20 kHz PWM"), link related issues, and include supporting artefacts such as photos or capture dumps when introducing hardware changes.
+- Keep changes focused; coordinate breaking register-map or toolchain updates before merging, and ensure submodules are updated with explicit commands in the PR narrative.
