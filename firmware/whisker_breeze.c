@@ -5,6 +5,11 @@
 #include <string.h>
 #include <stdarg.h>
 
+typedef int32_t fix16_t;
+
+#define FIX16_FRAC_BITS 16
+#define FIX16_ONE       (1 << FIX16_FRAC_BITS)
+
 #define SSD1306_128X64
 
 static bool g_display_error_seen = false;
@@ -46,40 +51,40 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 /* -------------------------------------------------------------------------- */
 /* Control constants                                                          */
 /* -------------------------------------------------------------------------- */
-#define FAN_PWM_PERIOD_TICKS      2400u      /* 48 MHz / 20 kHz */
-#define FAN_PWM_MIN_DUTY          0.10f
-#define FAN_PWM_MAX_DUTY          1.00f
-#define FAN_PWM_RAMP_STEP         0.02f
-#define FAN_ADJUST_RATE_PER_MS    0.0005f
-#define FAN_SOFT_START_MS         100u
-#define FAN_TACH_TIMEOUT_MS       500u
-#define FAN_TACH_TIMER_PRESCALER  479u      /* 48 MHz / (479+1) = 100 kHz */
-#define FAN_TACH_TIMER_CLOCK_HZ   (48000000u / (FAN_TACH_TIMER_PRESCALER + 1u))
-#define FAN_TACH_PULSES_PER_REV    2u
-#define FAN_TACH_MAX_RPM           6000.0f
-#define FAN_STALL_RPM_THRESHOLD    50.0f
-#define FAN_POWER_ON_DELAY_MS       1u
-#define FAN_DEFAULT_MIN_RPM         100.0f
-#define FAN_DEFAULT_MAX_RPM         20000.0f
-#define FAN_DEFAULT_MIN_RATIO       (FAN_DEFAULT_MIN_RPM / FAN_DEFAULT_MAX_RPM)
-#define FAN_RPM_GLITCH_MIN_BASE     300.0f
-#define FAN_RPM_GLITCH_UPPER_RPM    4500.0f
-#define INA226_12V_RAW_THRESHOLD    9200u   /* 11.5 V / 1.25 mV */
-#define FAN_CALIBRATION_STABLE_MS   500u
-#define FAN_CALIBRATION_MIN_MS      2000u
-#define FAN_CALIBRATION_DELTA_RPM   25.0f
+#define FAN_PWM_PERIOD_TICKS          2400u      /* 48 MHz / 20 kHz */
+#define FAN_PWM_MIN_DUTY_Q16          (FIX16_ONE / 10)         /* 0.10 */
+#define FAN_PWM_MAX_DUTY_Q16          (FIX16_ONE)
+#define FAN_PWM_RAMP_STEP_Q16         (FIX16_ONE / 50)         /* 0.02 */
+#define FAN_ADJUST_RATE_PER_MS_Q16    (FIX16_ONE / 2000)       /* 0.0005 */
+#define FAN_SOFT_START_MS             100u
+#define FAN_TACH_TIMEOUT_MS           500u
+#define FAN_TACH_TIMER_PRESCALER      479u      /* 48 MHz / (479+1) = 100 kHz */
+#define FAN_TACH_TIMER_CLOCK_HZ       (48000000u / (FAN_TACH_TIMER_PRESCALER + 1u))
+#define FAN_TACH_PULSES_PER_REV       2u
+#define FAN_TACH_MAX_RPM              6000u
+#define FAN_STALL_RPM_THRESHOLD       50u
+#define FAN_POWER_ON_DELAY_MS         1u
+#define FAN_DEFAULT_MIN_RPM           100u
+#define FAN_DEFAULT_MAX_RPM           20000u
+#define FAN_DEFAULT_MIN_RATIO_Q16     ((fix16_t)((((uint64_t)FAN_DEFAULT_MIN_RPM) << FIX16_FRAC_BITS) / (FAN_DEFAULT_MAX_RPM)))
+#define FAN_RPM_GLITCH_MIN_BASE       300u
+#define FAN_RPM_GLITCH_UPPER_RPM      4500u
+#define INA226_12V_RAW_THRESHOLD      9200u   /* 11.5 V / 1.25 mV */
+#define FAN_CALIBRATION_STABLE_MS     500u
+#define FAN_CALIBRATION_MIN_MS        2000u
+#define FAN_CALIBRATION_DELTA_RPM     25u
 
 #ifndef INA226_I2C_ADDR
 #define INA226_I2C_ADDR           0x40u
 #endif
-#ifndef INA226_SHUNT_OHMS
-#define INA226_SHUNT_OHMS         0.010f  /* 10 mΩ shunt on Whisker Breeze rev */
+#ifndef INA226_SHUNT_MICRO_OHMS
+#define INA226_SHUNT_MICRO_OHMS   10000u   /* 10 mΩ shunt */
 #endif
-#ifndef INA226_MAX_EXPECTED_CURRENT_A
-#define INA226_MAX_EXPECTED_CURRENT_A 2.0f
+#ifndef INA226_MAX_EXPECTED_CURRENT_MA
+#define INA226_MAX_EXPECTED_CURRENT_MA 2000u
 #endif
-#define INA226_CURRENT_LSB        (INA226_MAX_EXPECTED_CURRENT_A / 32768.0f)
-#define INA226_POWER_LSB          (25.0f * INA226_CURRENT_LSB)
+#define INA226_CURRENT_LSB_NA     ((uint32_t)(((uint64_t)INA226_MAX_EXPECTED_CURRENT_MA * 1000000ull) / 32768u))
+#define INA226_POWER_LSB_NW       (25u * INA226_CURRENT_LSB_NA)
 #define INA226_POLL_INTERVAL_MS   200u
 
 #define INA226_REG_CONFIG       0x00u
@@ -99,9 +104,9 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 #define LOG_SAMPLE_PERIOD_MS      1000u
 #define LOG_FORCE_INTERVAL_MS     5000u
-#define LOG_DELTA_TARGET          0.02f
-#define LOG_DELTA_DUTY            0.02f
-#define LOG_DELTA_RPM             50.0f
+#define LOG_DELTA_TARGET_Q16      (FIX16_ONE / 50)  /* 0.02 */
+#define LOG_DELTA_DUTY_Q16        (FIX16_ONE / 50)  /* 0.02 */
+#define LOG_DELTA_RPM             50u
 
 #define MODE_DEBOUNCE_TICKS       3u
 #define LOOP_PERIOD_MS            10u
@@ -141,10 +146,10 @@ typedef enum {
 
 typedef struct {
     fan_phase_t phase;
-    float target_duty;
-    float current_duty;
-    float rpm;
-    float rpm_max;
+    fix16_t target_duty;
+    fix16_t current_duty;
+    uint32_t rpm;
+    uint32_t rpm_max;
     bool rpm_valid;
     uint32_t soft_timer_ms;
     bool power_enabled;
@@ -160,10 +165,10 @@ typedef struct {
     bool configured;
     bool valid;
     bool online_announced;
-    float bus_voltage_v;
-    float shunt_voltage_v;
-    float current_a;
-    float power_w;
+    int32_t bus_voltage_mv;
+    int32_t shunt_voltage_uw;
+    int32_t current_ma;
+    int32_t power_mw;
     uint32_t poll_timer_ms;
     uint32_t config_failures;
     uint32_t sample_failures;
@@ -193,9 +198,9 @@ typedef struct {
     uint32_t since_last_log;
     bool have_last;
     fan_phase_t last_phase;
-    float last_target;
-    float last_duty;
-    float last_rpm;
+    fix16_t last_target;
+    fix16_t last_duty;
+    uint32_t last_rpm;
     bool last_rpm_valid;
     bool last_vbus;
     bool last_pd;
@@ -207,7 +212,7 @@ typedef struct {
 typedef struct {
     bool active;
     bool completed;
-    float peak_rpm;
+    uint32_t peak_rpm;
     uint32_t last_improve_ms;
     uint32_t start_ms;
 } fan_calibration_state_t;
@@ -223,21 +228,21 @@ static controls_state_t g_controls = {
 
 static uint8_t g_controls_raw_mask = 0u;
 
-static float g_manual_target = 1.0f;
+static fix16_t g_manual_target = FIX16_ONE;
 
 static fan_state_t g_fan = {
     .phase = FAN_PHASE_SOFT_START,
-    .target_duty = 0.0f,
-    .current_duty = 0.0f,
-    .rpm = 0.0f,
-    .rpm_max = 0.0f,
+    .target_duty = 0,
+    .current_duty = 0,
+    .rpm = 0u,
+    .rpm_max = 0u,
     .rpm_valid = false,
     .soft_timer_ms = 0,
     .power_enabled = false,
     .power_settle_ms = 0,
 };
 
-static float g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO;
+static fix16_t g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO_Q16;
 
 static power_state_t g_power = {
     .vbus_valid = false,
@@ -248,10 +253,10 @@ static ina226_state_t g_ina = {
     .configured = false,
     .valid = false,
     .online_announced = false,
-    .bus_voltage_v = 0.0f,
-    .shunt_voltage_v = 0.0f,
-    .current_a = 0.0f,
-    .power_w = 0.0f,
+    .bus_voltage_mv = 0,
+    .shunt_voltage_uw = 0,
+    .current_ma = 0,
+    .power_mw = 0,
     .poll_timer_ms = 0,
     .config_failures = 0,
     .sample_failures = 0,
@@ -281,9 +286,9 @@ static log_state_t g_log = {
     .since_last_log = 1000,
     .have_last = false,
     .last_phase = FAN_PHASE_SOFT_START,
-    .last_target = 0.0f,
-    .last_duty = 0.0f,
-    .last_rpm = 0.0f,
+    .last_target = 0,
+    .last_duty = 0,
+    .last_rpm = 0u,
     .last_rpm_valid = false,
     .last_vbus = false,
     .last_pd = false,
@@ -295,7 +300,7 @@ static log_state_t g_log = {
 static fan_calibration_state_t g_fan_calibration = {
     .active = true,
     .completed = false,
-    .peak_rpm = 0.0f,
+    .peak_rpm = 0u,
     .last_improve_ms = 0u,
     .start_ms = 0u,
 };
@@ -304,10 +309,10 @@ static void fan_calibration_reset(void)
 {
     g_fan_calibration.active = true;
     g_fan_calibration.completed = false;
-    g_fan_calibration.peak_rpm = 0.0f;
+    g_fan_calibration.peak_rpm = 0u;
     g_fan_calibration.last_improve_ms = 0u;
     g_fan_calibration.start_ms = 0u;
-    g_manual_target = 1.0f;
+    g_manual_target = FIX16_ONE;
 }
 
 static uint32_t g_i2c_scan_last_ms = 0u;
@@ -321,12 +326,30 @@ static uint32_t g_uptime_ms = 0;
 /* -------------------------------------------------------------------------- */
 /* Utility helpers                                                            */
 /* -------------------------------------------------------------------------- */
-static float fabsf_local(float x)
+static inline fix16_t fix16_from_int(int32_t value)
 {
-    return (x >= 0.0f) ? x : -x;
+    return (fix16_t)(value << FIX16_FRAC_BITS);
 }
 
-static float clampf(float value, float min_val, float max_val)
+static inline int32_t fix16_to_int(fix16_t value)
+{
+    return (int32_t)(value >> FIX16_FRAC_BITS);
+}
+
+static inline fix16_t fix16_mul(fix16_t a, fix16_t b)
+{
+    return (fix16_t)(((int64_t)a * (int64_t)b) >> FIX16_FRAC_BITS);
+}
+
+static inline fix16_t fix16_div(fix16_t numer, fix16_t denom)
+{
+    if (denom == 0) {
+        return 0;
+    }
+    return (fix16_t)(((int64_t)numer << FIX16_FRAC_BITS) / denom);
+}
+
+static inline fix16_t fix16_clamp(fix16_t value, fix16_t min_val, fix16_t max_val)
 {
     if (value < min_val) {
         return min_val;
@@ -337,22 +360,28 @@ static float clampf(float value, float min_val, float max_val)
     return value;
 }
 
-static int32_t round_to_i32(float value)
+static inline fix16_t fix16_abs(fix16_t value)
 {
-    return (int32_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
+    return (value >= 0) ? value : (fix16_t)(-value);
 }
 
-static uint16_t percent_from_unit(float value)
+static uint16_t percent_from_ratio(fix16_t value)
 {
-    float scaled = value * 100.0f;
-    scaled = clampf(scaled, 0.0f, 100.0f);
-    return (uint16_t)round_to_i32(scaled);
+    if (value <= 0) {
+        return 0u;
+    }
+    if (value >= FIX16_ONE) {
+        return 100u;
+    }
+    return (uint16_t)(((int64_t)value * 100 + (FIX16_ONE / 2)) >> FIX16_FRAC_BITS);
 }
 
-static uint16_t rpm_from_float(float rpm)
+static uint16_t rpm_to_u16(uint32_t rpm)
 {
-    float clamped = clampf(rpm, 0.0f, FAN_TACH_MAX_RPM);
-    return (uint16_t)round_to_i32(clamped);
+    if (rpm > 0xFFFFu) {
+        return 0xFFFFu;
+    }
+    return (uint16_t)rpm;
 }
 
 static void reset_fan_log_timer(void)
@@ -410,11 +439,11 @@ static void log_pd_snapshot(const char *reason)
 
 static void log_fan_snapshot(void)
 {
-    uint16_t target_pct = percent_from_unit(g_manual_target);
-    uint16_t duty_pct = percent_from_unit(g_fan.current_duty);
-    uint16_t rpm_now = rpm_from_float(g_fan.rpm);
+    uint16_t target_pct = percent_from_ratio(g_manual_target);
+    uint16_t duty_pct = percent_from_ratio(g_fan.current_duty);
+    uint16_t rpm_now = rpm_to_u16(g_fan.rpm);
     uint16_t bus_raw = g_ina.valid ? g_ina.raw_bus_reg : 0u;
-    float current_ma = g_ina.current_a * 1000.0f;
+    int32_t current_ma = g_ina.current_ma;
     uint16_t compare_ticks = TIM1->CH3CVR;
     uint8_t btn_raw_mask = g_controls_raw_mask;
     uint8_t btn_stable_mask = 0u;
@@ -794,17 +823,17 @@ static bool i2c1_read_u16(uint8_t addr, uint8_t reg, uint16_t *value)
 
 static uint16_t ina226_compute_calibration(void)
 {
-    float denom = INA226_CURRENT_LSB * INA226_SHUNT_OHMS;
-    if (denom <= 0.0f) {
+    uint64_t denom = (uint64_t)INA226_CURRENT_LSB_NA * (uint64_t)INA226_SHUNT_MICRO_OHMS;
+    if (denom == 0u) {
         return 0u;
     }
-    float cal = 0.00512f / denom;
-    if (cal < 0.0f) {
-        cal = 0.0f;
-    } else if (cal > 65535.0f) {
-        cal = 65535.0f;
+
+    /* 0.00512 * 1e12 = 5_120_000_000 */
+    uint64_t cal = 5120000000ull / denom;
+    if (cal > 0xFFFFu) {
+        cal = 0xFFFFu;
     }
-    return (uint16_t)round_to_i32(cal);
+    return (uint16_t)cal;
 }
 
 static bool ina226_write_register(uint8_t reg, uint16_t value)
@@ -924,10 +953,10 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.online_announced = false;
         g_ina.configured = false;
         g_ina.address_valid = false;
-        g_ina.bus_voltage_v = 0.0f;
-        g_ina.shunt_voltage_v = 0.0f;
-        g_ina.current_a = 0.0f;
-        g_ina.power_w = 0.0f;
+        g_ina.bus_voltage_mv = 0;
+        g_ina.shunt_voltage_uw = 0;
+        g_ina.current_ma = 0;
+        g_ina.power_mw = 0;
         g_ina.raw_bus_reg = 0u;
         if (g_ina.sample_failures < UINT32_MAX) {
             g_ina.sample_failures++;
@@ -938,15 +967,21 @@ static void ina226_update(uint32_t delta_ms)
     }
 
     g_ina.raw_bus_reg = raw_bus;
-    g_ina.bus_voltage_v = (float)raw_bus * 0.00125f;
-    g_ina.shunt_voltage_v = (float)((int16_t)raw_shunt) * 0.0000025f;
-    g_ina.current_a = (float)((int16_t)raw_current) * INA226_CURRENT_LSB;
-    g_ina.power_w = (float)raw_power * INA226_POWER_LSB;
+
+    int32_t bus_mv = (int32_t)(((uint64_t)raw_bus * 1250u + 500u) / 1000u);
+    int32_t shunt_uw = (int32_t)((((int64_t)(int16_t)raw_shunt) * 25) / 10);
+    int32_t current_ma = (int32_t)((((int64_t)(int16_t)raw_current) * INA226_CURRENT_LSB_NA + 500000) / 1000000);
+    int32_t power_mw = (int32_t)((((int64_t)raw_power) * INA226_POWER_LSB_NW + 500000) / 1000000);
+
+    g_ina.bus_voltage_mv = bus_mv;
+    g_ina.shunt_voltage_uw = shunt_uw;
+    g_ina.current_ma = current_ma;
+    g_ina.power_mw = power_mw;
     g_ina.valid = true;
     if (!g_ina.online_announced) {
-        long bus_whole = (long)g_ina.bus_voltage_v;
-        long bus_frac = (long)((g_ina.bus_voltage_v - (float)bus_whole) * 100.0f);
-        emit_log("[ina]%ld.%02ldV", bus_whole, bus_frac);
+        long bus_whole = bus_mv / 1000;
+        long bus_frac = bus_mv % 1000;
+        emit_log("[ina]%ld.%03ldV", bus_whole, bus_frac);
         g_ina.online_announced = true;
         g_ina.last_error_report_ms = 0u;
     }
@@ -1009,16 +1044,21 @@ static void display_render(void)
     char line[17];
     ssd1306_setbuf(0);
 
-    snprintf(line, sizeof line, "Set   %3.0f%%", g_manual_target * 100.0f);
+    uint16_t set_pct = percent_from_ratio(g_manual_target);
+    uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
+    uint32_t rpm_now = g_fan.rpm;
+    uint32_t rpm_peak = g_fan.rpm_max;
+
+    snprintf(line, sizeof line, "Set   %3u%%", (unsigned)set_pct);
     ssd1306_drawstr(0, 0, line, 1);
 
-    snprintf(line, sizeof line, "Out   %3.0f%%", g_fan.current_duty * 100.0f);
+    snprintf(line, sizeof line, "Out   %3u%%", (unsigned)out_pct);
     ssd1306_drawstr(0, 8, line, 1);
 
-    snprintf(line, sizeof line, "RPM   %4.0f", g_fan.rpm);
+    snprintf(line, sizeof line, "RPM   %4lu", (unsigned long)rpm_now);
     ssd1306_drawstr(0, 16, line, 1);
 
-    snprintf(line, sizeof line, "Peak  %4.0f", g_fan.rpm_max);
+    snprintf(line, sizeof line, "Peak  %4lu", (unsigned long)rpm_peak);
     ssd1306_drawstr(0, 24, line, 1);
 
     snprintf(line, sizeof line, "PD %s 12V %s",
@@ -1080,23 +1120,27 @@ static void display_try_init(void)
 /* -------------------------------------------------------------------------- */
 /* PWM helpers                                                                */
 /* -------------------------------------------------------------------------- */
-static void pwm_set_duty(float duty)
+static void pwm_set_duty(fix16_t duty)
 {
-    duty = clampf(duty, 0.0f, 1.0f);
+    duty = fix16_clamp(duty, 0, FIX16_ONE);
     g_fan.current_duty = duty;
-    uint16_t compare = (uint16_t)round_to_i32(((float)(FAN_PWM_PERIOD_TICKS - 1u)) * duty);
-    TIM1->CH3CVR = compare;
+
+    uint32_t compare = (uint32_t)((((int64_t)(FAN_PWM_PERIOD_TICKS - 1u)) * duty + (FIX16_ONE / 2)) >> FIX16_FRAC_BITS);
+    if (compare > (FAN_PWM_PERIOD_TICKS - 1u)) {
+        compare = FAN_PWM_PERIOD_TICKS - 1u;
+    }
+    TIM1->CH3CVR = (uint16_t)compare;
 }
 
-static void fan_apply_pwm(float duty, uint32_t delta_ms)
+static void fan_apply_pwm(fix16_t duty, uint32_t delta_ms)
 {
-    duty = clampf(duty, 0.0f, 1.0f);
+    duty = fix16_clamp(duty, 0, FIX16_ONE);
 
-    if (duty <= 0.0f) {
+    if (duty <= 0) {
         funDigitalWrite(PIN_FAN_ENABLE, FUN_LOW);
         g_fan.power_enabled = false;
         g_fan.power_settle_ms = 0u;
-        pwm_set_duty(0.0f);
+        pwm_set_duty(0);
         return;
     }
 
@@ -1112,7 +1156,7 @@ static void fan_apply_pwm(float duty, uint32_t delta_ms)
         } else {
             g_fan.power_settle_ms -= delta_ms;
         }
-        pwm_set_duty(0.0f);
+        pwm_set_duty(0);
         return;
     }
 
@@ -1174,7 +1218,7 @@ static void pwm_init(void)
     TIM1->BDTR |= TIM_MOE;
     TIM1->CTLR1 |= TIM_CEN;
 
-    pwm_set_duty(0.0f);
+    pwm_set_duty(0);
 }
 
 static void tach_init(void)
@@ -1233,7 +1277,7 @@ static void controls_update(void)
 static void tach_update(uint32_t delta_ms)
 {
     static uint32_t tach_timeout = 0;
-    static float last_good_rpm = 0.0f;
+    static uint32_t last_good_rpm = 0u;
 
     tach_timeout += delta_ms;
 
@@ -1241,26 +1285,29 @@ static void tach_update(uint32_t delta_ms)
         uint16_t period = g_tach.period_ticks;
         g_tach.sample_ready = 0;
         if (period > 0u) {
-            float freq = (float)FAN_TACH_TIMER_CLOCK_HZ / (float)period;
-            float rpm = (freq * 60.0f) / (float)FAN_TACH_PULSES_PER_REV;
-            float candidate = clampf(rpm, 0.0f, FAN_TACH_MAX_RPM);
+            uint64_t numerator = (uint64_t)FAN_TACH_TIMER_CLOCK_HZ * 60u;
+            uint64_t denominator = (uint64_t)period * FAN_TACH_PULSES_PER_REV;
+            uint32_t rpm = (denominator == 0u) ? 0u : (uint32_t)(numerator / denominator);
+            if (rpm > FAN_TACH_MAX_RPM) {
+                rpm = FAN_TACH_MAX_RPM;
+            }
             tach_timeout = 0;
 
             bool accept = true;
-            if (candidate > FAN_RPM_GLITCH_UPPER_RPM) {
+            if (rpm > FAN_RPM_GLITCH_UPPER_RPM) {
                 accept = false;
             }
 
             if (accept && last_good_rpm >= FAN_RPM_GLITCH_MIN_BASE &&
-                candidate < FAN_RPM_GLITCH_MIN_BASE &&
+                rpm < FAN_RPM_GLITCH_MIN_BASE &&
                 g_manual_target > g_fan_min_ratio) {
                 accept = false;
             }
 
             if (accept) {
-                g_fan.rpm = candidate;
+                g_fan.rpm = rpm;
                 g_fan.rpm_valid = true;
-                last_good_rpm = candidate;
+                last_good_rpm = rpm;
             }
         }
     }
@@ -1268,18 +1315,18 @@ static void tach_update(uint32_t delta_ms)
     if (tach_timeout >= FAN_TACH_TIMEOUT_MS) {
         tach_timeout = 0;
         g_fan.rpm_valid = false;
-        g_fan.rpm = 0.0f;
-        last_good_rpm = 0.0f;
+        g_fan.rpm = 0u;
+        last_good_rpm = 0u;
     }
 }
 
 static void fan_update(uint32_t delta_ms)
 {
     if (!g_power.vbus_valid) {
-        fan_apply_pwm(0.0f, delta_ms);
+        fan_apply_pwm(0, delta_ms);
         g_fan.phase = FAN_PHASE_SOFT_START;
         g_fan.soft_timer_ms = 0;
-        g_fan.rpm_max = 0.0f;
+        g_fan.rpm_max = 0u;
         g_fan.rpm_valid = false;
         return;
     }
@@ -1287,9 +1334,9 @@ static void fan_update(uint32_t delta_ms)
     controls_update();
 
     if (g_fan_calibration.active) {
-        g_manual_target = 1.0f;
+        g_manual_target = FIX16_ONE;
     } else {
-        float adjust = FAN_ADJUST_RATE_PER_MS * (float)delta_ms;
+        fix16_t adjust = (fix16_t)((int64_t)FAN_ADJUST_RATE_PER_MS_Q16 * delta_ms);
         if (g_controls.decrease_input.stable_state) {
             g_manual_target -= adjust;
         }
@@ -1297,44 +1344,47 @@ static void fan_update(uint32_t delta_ms)
             g_manual_target += adjust;
         }
 
-        g_manual_target = clampf(g_manual_target, 0.0f, 1.0f);
+        g_manual_target = fix16_clamp(g_manual_target, 0, FIX16_ONE);
         if (g_manual_target < g_fan_min_ratio) {
             g_manual_target = g_fan_min_ratio;
         }
     }
 
-    float ratio = g_manual_target;
-    float duty_target = FAN_PWM_MIN_DUTY + ratio * (FAN_PWM_MAX_DUTY - FAN_PWM_MIN_DUTY);
+    fix16_t ratio = g_manual_target;
+    fix16_t duty_span = FAN_PWM_MAX_DUTY_Q16 - FAN_PWM_MIN_DUTY_Q16;
+    fix16_t duty_target = FAN_PWM_MIN_DUTY_Q16 + fix16_mul(ratio, duty_span);
     g_fan.target_duty = duty_target;
 
     if (g_fan.rpm_valid) {
         if (ratio > g_fan_min_ratio && g_fan.rpm < FAN_STALL_RPM_THRESHOLD) {
-            g_fan_min_ratio = clampf(ratio, 0.0f, 1.0f);
+            g_fan_min_ratio = fix16_clamp(ratio, 0, FIX16_ONE);
         }
     }
 
-    if (!g_fan.rpm_valid && g_fan_min_ratio > FAN_DEFAULT_MIN_RATIO) {
-        g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO;
+    if (!g_fan.rpm_valid && g_fan_min_ratio > FAN_DEFAULT_MIN_RATIO_Q16) {
+        g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO_Q16;
     }
 
     if (g_fan.phase == FAN_PHASE_SOFT_START) {
         g_fan.soft_timer_ms += delta_ms;
-        float progress = (g_fan.soft_timer_ms >= FAN_SOFT_START_MS)
-                             ? 1.0f
-                             : (float)g_fan.soft_timer_ms / (float)FAN_SOFT_START_MS;
-        float start_level = FAN_PWM_MAX_DUTY;
-        float duty = start_level + (duty_target - start_level) * progress;
+        fix16_t progress = (g_fan.soft_timer_ms >= FAN_SOFT_START_MS)
+                               ? FIX16_ONE
+                               : fix16_div(fix16_from_int((int32_t)g_fan.soft_timer_ms),
+                                            fix16_from_int((int32_t)FAN_SOFT_START_MS));
+        fix16_t start_level = FAN_PWM_MAX_DUTY_Q16;
+        fix16_t duty_delta = duty_target - start_level;
+        fix16_t duty = start_level + fix16_mul(duty_delta, progress);
         fan_apply_pwm(duty, delta_ms);
 
         if (g_fan.soft_timer_ms >= FAN_SOFT_START_MS) {
             g_fan.phase = FAN_PHASE_RUN;
         }
     } else {
-        float delta = g_fan.target_duty - g_fan.current_duty;
-        if (delta > FAN_PWM_RAMP_STEP) {
-            fan_apply_pwm(g_fan.current_duty + FAN_PWM_RAMP_STEP, delta_ms);
-        } else if (delta < -FAN_PWM_RAMP_STEP) {
-            fan_apply_pwm(g_fan.current_duty - FAN_PWM_RAMP_STEP, delta_ms);
+        fix16_t delta = g_fan.target_duty - g_fan.current_duty;
+        if (delta > FAN_PWM_RAMP_STEP_Q16) {
+            fan_apply_pwm(g_fan.current_duty + FAN_PWM_RAMP_STEP_Q16, delta_ms);
+        } else if (delta < -FAN_PWM_RAMP_STEP_Q16) {
+            fan_apply_pwm(g_fan.current_duty - FAN_PWM_RAMP_STEP_Q16, delta_ms);
         } else {
             fan_apply_pwm(g_fan.target_duty, delta_ms);
         }
@@ -1350,7 +1400,7 @@ static void fan_update(uint32_t delta_ms)
         }
 
         uint32_t now = g_uptime_ms;
-        float rpm_now = g_fan.rpm;
+        uint32_t rpm_now = g_fan.rpm;
 
         if (g_fan_calibration.start_ms == 0u) {
             g_fan_calibration.start_ms = now;
@@ -1365,24 +1415,30 @@ static void fan_update(uint32_t delta_ms)
 
         if ((now - g_fan_calibration.start_ms) >= FAN_CALIBRATION_MIN_MS &&
             (now - g_fan_calibration.last_improve_ms) >= FAN_CALIBRATION_STABLE_MS) {
-            float peak = g_fan_calibration.peak_rpm;
-            if (peak < 1.0f) {
-                peak = 1.0f;
+            uint32_t peak = g_fan_calibration.peak_rpm;
+            if (peak == 0u) {
+                peak = 1u;
             }
 
-            float ratio_100rpm = clampf(100.0f / peak, 0.0f, 1.0f);
-            float target_ratio = (ratio_100rpm > 0.1f) ? ratio_100rpm : 0.1f;
-            g_fan_min_ratio = clampf(ratio_100rpm, FAN_DEFAULT_MIN_RATIO, 1.0f);
+            fix16_t ratio_100rpm = fix16_div(fix16_from_int(100), fix16_from_int((int32_t)peak));
+            ratio_100rpm = fix16_clamp(ratio_100rpm, 0, FIX16_ONE);
+
+            g_fan_min_ratio = fix16_clamp(ratio_100rpm, FAN_DEFAULT_MIN_RATIO_Q16, FIX16_ONE);
+
+            fix16_t target_ratio = ratio_100rpm;
+            if (target_ratio < FAN_PWM_MIN_DUTY_Q16) {
+                target_ratio = FAN_PWM_MIN_DUTY_Q16;
+            }
             if (target_ratio < g_fan_min_ratio) {
                 target_ratio = g_fan_min_ratio;
             }
 
-            g_manual_target = clampf(target_ratio, 0.0f, 1.0f);
+            g_manual_target = fix16_clamp(target_ratio, 0, FIX16_ONE);
             g_fan_calibration.active = false;
             g_fan_calibration.completed = true;
             emit_log("[cal]%u/%u",
-                     (unsigned)rpm_from_float(g_fan_calibration.peak_rpm),
-                     (unsigned)percent_from_unit(g_manual_target));
+                     (unsigned)rpm_to_u16(g_fan_calibration.peak_rpm),
+                     (unsigned)percent_from_ratio(g_manual_target));
         }
     }
 
@@ -1402,10 +1458,10 @@ static void power_update(void)
     g_power.ina_alert = INA_INT_ACTIVE_LOW ? ina_raw : !ina_raw;
 
     if (!g_power.vbus_valid) {
-        fan_apply_pwm(0.0f, 0u);
+        fan_apply_pwm(0, 0u);
         g_fan.phase = FAN_PHASE_SOFT_START;
         g_fan.soft_timer_ms = 0;
-        g_fan.rpm_max = 0.0f;
+        g_fan.rpm_max = 0u;
         g_fan.rpm_valid = false;
         fan_calibration_reset();
     } else if (!prev_vbus && g_power.vbus_valid) {
@@ -1519,12 +1575,20 @@ static void heartbeat_log(uint32_t tick_ms)
             g_power.vbus_valid != g_log.last_vbus ||
             g_fan.rpm_valid != g_log.last_rpm_valid) {
             should_log = true;
-        } else if (fabsf_local(g_manual_target - g_log.last_target) > LOG_DELTA_TARGET ||
-                   fabsf_local(g_fan.current_duty - g_log.last_duty) > LOG_DELTA_DUTY ||
-                   fabsf_local(g_fan.rpm - g_log.last_rpm) > LOG_DELTA_RPM) {
-            should_log = true;
-        } else if (g_pd.last_status != g_log.last_status) {
-            should_log = true;
+        } else {
+            fix16_t target_delta = fix16_abs(g_manual_target - g_log.last_target);
+            fix16_t duty_delta = fix16_abs(g_fan.current_duty - g_log.last_duty);
+            uint32_t rpm_delta = (g_fan.rpm > g_log.last_rpm)
+                                     ? (g_fan.rpm - g_log.last_rpm)
+                                     : (g_log.last_rpm - g_fan.rpm);
+
+            if (target_delta > LOG_DELTA_TARGET_Q16 ||
+                duty_delta > LOG_DELTA_DUTY_Q16 ||
+                rpm_delta > LOG_DELTA_RPM) {
+                should_log = true;
+            } else if (g_pd.last_status != g_log.last_status) {
+                should_log = true;
+            }
         }
     }
 
