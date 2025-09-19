@@ -82,6 +82,18 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define PIN_MODE_SELECT       PD3
 #define PIN_MODE_SLOW         PD4
 
+/* Temperature sense (NTC on PA2 → ADC channel 2) */
+#define PIN_TEMP_SENSE        PA2
+#define TEMP_ADC_CHANNEL      ANALOG_0
+
+/* MF52A103F3435 with R3=8.2k divider @3.3V
+ * CH32V003 ADC is 10-bit (0..1023). Anchor codes (rounded):
+ *   20°C → ~611 counts; 40°C → ~422 counts.
+ * If移植到12位ADC, 需按比例更新。
+ */
+#define TEMP_ADC_CODE_20C     611
+#define TEMP_ADC_CODE_40C     422
+
 /* -------------------------------------------------------------------------- */
 /* Control constants                                                          */
 /* -------------------------------------------------------------------------- */
@@ -234,6 +246,16 @@ typedef struct {
 } tach_state_t;
 
 typedef struct {
+    /* Raw and filtered ADC for PA2 thermistor divider */
+    uint16_t adc_raw;
+    uint16_t adc_avg;
+    /* Temperature in centi-degC; sign-capable */
+    int16_t temp_c_x100;
+    /* Update pacing */
+    uint32_t sample_timer_ms;
+} temp_state_t;
+
+typedef struct {
     uint32_t sample_accum;
     uint32_t since_last_log;
     bool have_last;
@@ -339,12 +361,28 @@ static log_state_t g_log = {
 };
 
 static fan_calibration_state_t g_fan_calibration = {
-    .active = true,
+    .active = false,
     .completed = false,
     .peak_rpm = 0u,
     .last_improve_ms = 0u,
     .start_ms = 0u,
 };
+
+static temp_state_t g_temp = {
+    .adc_raw = 0u,
+    .adc_avg = 0u,
+    .temp_c_x100 = 0,
+    .sample_timer_ms = 0u,
+};
+
+typedef enum {
+    CONTROL_MODE_CALIB = 0,
+    CONTROL_MODE_TEMP,
+    CONTROL_MODE_MANUAL
+} control_mode_t;
+
+/* 默认先测速，完成后进入温控；MODE 只在 TEMP/MANUAL 间切换 */
+static control_mode_t g_mode = CONTROL_MODE_CALIB;
 
 static void fan_calibration_reset(void)
 {
@@ -512,6 +550,7 @@ static void log_fan_snapshot(void)
     uint16_t target_pct = percent_from_ratio(g_manual_target);
     uint16_t duty_pct = percent_from_ratio(g_fan.current_duty);
     uint16_t rpm_now = rpm_to_u16(g_fan.rpm);
+    uint16_t temp_c = (g_temp.temp_c_x100 >= 0) ? (uint16_t)g_temp.temp_c_x100 : 0u;
     uint16_t bus_raw = g_ina.valid ? g_ina.raw_bus_reg : 0u;
     int32_t current_ma = g_ina.current_ma;
     uint16_t compare_ticks = TIM1->CH3CVR;
@@ -528,11 +567,14 @@ static void log_fan_snapshot(void)
         btn_stable_mask |= 0x4u;
     }
 
-    emit_log("[fan] p=%d t=%u d=%u r=%u v=%d 12=%d b=%04X i=%ld c=%u k=%u/%u",
+    emit_log("[fan] p=%d t=%u d=%u r=%u tmp=%u adc=%u/%u v=%d 12=%d b=%04X i=%ld c=%u k=%u/%u",
              g_fan.phase,
              (unsigned)target_pct,
              (unsigned)duty_pct,
              (unsigned)rpm_now,
+             (unsigned)temp_c,
+             (unsigned)g_temp.adc_raw,
+             (unsigned)g_temp.adc_avg,
              g_power.vbus_valid ? 1 : 0,
              g_pd.have_12v ? 1 : 0,
              (unsigned)bus_raw,
@@ -1379,7 +1421,107 @@ static void controls_update(void)
 
     debounce_update(&g_controls.decrease_input, dec_pressed);
     debounce_update(&g_controls.increase_input, inc_pressed);
-    debounce_update(&g_controls.hold_input, hold_pressed);
+    bool changed = debounce_update(&g_controls.hold_input, hold_pressed);
+
+    /* Rising edge on MODE → 只在温控/手动间切换；测速模式下无效 */
+    static bool s_last_hold = false;
+    if (changed) {
+        bool now = g_controls.hold_input.stable_state;
+        if (now && !s_last_hold) {
+            if (g_mode != CONTROL_MODE_CALIB) {
+                g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+                emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
+            }
+        }
+        s_last_hold = now;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Temperature                                                                */
+/* -------------------------------------------------------------------------- */
+#define TEMP_POLL_INTERVAL_MS   50u
+#define TEMP_AVG_SHIFT          3u    /* IIR avg: 1/8 */
+
+static uint16_t temp_adc_sample(void);
+
+static void temp_init(void)
+{
+    funGpioInitA();
+    funPinMode(PIN_TEMP_SENSE, GPIO_CFGLR_IN_ANALOG);
+    funAnalogInit();
+
+    /* Increase ADC sample time for channel 2 to 239.5 cycles.
+     * Source impedance ≈ R3||Rntc ≈ 0.5–8 kΩ; longer sampling improves accuracy.
+     */
+    uint32_t shift = (uint32_t)3u * (uint32_t)TEMP_ADC_CHANNEL; /* in SAMPTR2 */
+    ADC1->SAMPTR2 = (ADC1->SAMPTR2 & ~(7u << shift)) | (7u << shift);
+
+    /* 预充样本，避免上电瞬间误判 */
+    uint16_t seed = temp_adc_sample();
+    g_temp.adc_raw = seed;
+    g_temp.adc_avg = seed;
+}
+
+static uint16_t temp_adc_sample(void)
+{
+    /* Single conversion, 12-bit */
+    int sample = funAnalogRead(TEMP_ADC_CHANNEL);
+    if (sample < 0) {
+        sample = 0;
+    }
+    if (sample > 4095) {
+        sample = 4095;
+    }
+    return (uint16_t)sample;
+}
+
+static void temp_update(uint32_t delta_ms)
+{
+    g_temp.sample_timer_ms += delta_ms;
+    if (g_temp.sample_timer_ms < TEMP_POLL_INTERVAL_MS) {
+        return;
+    }
+    g_temp.sample_timer_ms = 0u;
+
+    uint16_t raw = temp_adc_sample();
+    g_temp.adc_raw = raw;
+
+    if (g_temp.adc_avg == 0u) {
+        g_temp.adc_avg = raw;
+    } else {
+        /* IIR averaging: avg += (raw - avg) / 2^N */
+        g_temp.adc_avg = (uint16_t)(g_temp.adc_avg + ((int32_t)raw - (int32_t)g_temp.adc_avg) / (1 << TEMP_AVG_SHIFT));
+    }
+
+    /* Rough linearized temperature between 20–40°C for logging */
+    int32_t span = (int32_t)TEMP_ADC_CODE_20C - (int32_t)TEMP_ADC_CODE_40C; /* positive */
+    int32_t delta = (int32_t)TEMP_ADC_CODE_20C - (int32_t)g_temp.adc_avg;   /* <0 when below 20C */
+    int32_t t_x100 = 2000 + ((delta * 2000 + (span/2)) / (span == 0 ? 1 : span));
+    if (t_x100 < -4000) t_x100 = -4000; /* clamp just to avoid overflow */
+    if (t_x100 > 12500) t_x100 = 12500;
+    g_temp.temp_c_x100 = (int16_t)t_x100;
+}
+
+static fix16_t temp_target_ratio_from_adc(uint16_t adc_avg)
+{
+    /* Map ADC code to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
+    int32_t span = (int32_t)TEMP_ADC_CODE_20C - (int32_t)TEMP_ADC_CODE_40C; /* 20°C window width in counts */
+    if (span <= 0) {
+        return FIX16_ONE;
+    }
+
+    if ((int32_t)adc_avg >= (int32_t)TEMP_ADC_CODE_20C) {
+        return 0; /* below 20°C → stop */
+    }
+    if ((int32_t)adc_avg <= (int32_t)TEMP_ADC_CODE_40C) {
+        return FIX16_ONE; /* >= 40°C → full */
+    }
+
+    int32_t pos = (int32_t)TEMP_ADC_CODE_20C - (int32_t)adc_avg; /* 0..span */
+    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(span));
+    fix16_t range = FIX16_ONE - g_fan_min_ratio;
+    return g_fan_min_ratio + fix16_mul(frac, range);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1444,9 +1586,14 @@ static void fan_update(uint32_t delta_ms)
 
     controls_update();
 
-    if (g_fan_calibration.active) {
-        g_manual_target = FIX16_ONE;
+    /* 三模式：测速→温控/手动；MODE只在温控/手动切换 */
+    if (g_mode == CONTROL_MODE_CALIB) {
+        g_manual_target = FIX16_ONE; /* 全速测峰值 */
+    } else if (g_mode == CONTROL_MODE_TEMP) {
+        fix16_t auto_target = temp_target_ratio_from_adc(g_temp.adc_avg);
+        g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
+        /* 手动：按键调整 */
         fix16_t adjust = (fix16_t)((int64_t)FAN_ADJUST_RATE_PER_MS_Q16 * delta_ms);
         if (g_controls.decrease_input.stable_state) {
             g_manual_target -= adjust;
@@ -1454,7 +1601,6 @@ static void fan_update(uint32_t delta_ms)
         if (g_controls.increase_input.stable_state) {
             g_manual_target += adjust;
         }
-
         g_manual_target = fix16_clamp(g_manual_target, 0, FIX16_ONE);
         if (g_manual_target < g_fan_min_ratio) {
             g_manual_target = g_fan_min_ratio;
@@ -1506,22 +1652,30 @@ static void fan_update(uint32_t delta_ms)
     }
 
     if (g_fan_calibration.active) {
-        if (!g_pd.have_12v || !g_fan.rpm_valid) {
+        /* 需要 12V；但即使当前 rpm 无效，只要曾经有效过也可完成 */
+        if (!g_pd.have_12v) {
             return;
         }
 
         uint32_t now = g_uptime_ms;
-        uint32_t rpm_now = g_fan.rpm;
 
-        if (g_fan_calibration.start_ms == 0u) {
-            g_fan_calibration.start_ms = now;
-            g_fan_calibration.last_improve_ms = now;
-            g_fan_calibration.peak_rpm = rpm_now;
-        }
+        if (g_fan.rpm_valid) {
+            uint32_t rpm_now = g_fan.rpm;
+            if (g_fan_calibration.start_ms == 0u) {
+                g_fan_calibration.start_ms = now;
+                g_fan_calibration.last_improve_ms = now;
+                g_fan_calibration.peak_rpm = rpm_now;
+            }
 
-        if (rpm_now > g_fan_calibration.peak_rpm + FAN_CALIBRATION_DELTA_RPM) {
-            g_fan_calibration.peak_rpm = rpm_now;
-            g_fan_calibration.last_improve_ms = now;
+            if (rpm_now > g_fan_calibration.peak_rpm + FAN_CALIBRATION_DELTA_RPM) {
+                g_fan_calibration.peak_rpm = rpm_now;
+                g_fan_calibration.last_improve_ms = now;
+            }
+        } else {
+            /* 未拿到首个有效样本则继续等待 */
+            if (g_fan_calibration.start_ms == 0u) {
+                return;
+            }
         }
 
         if ((now - g_fan_calibration.start_ms) >= FAN_CALIBRATION_MIN_MS &&
@@ -1550,6 +1704,10 @@ static void fan_update(uint32_t delta_ms)
             emit_log("[cal]%u/%u",
                      (unsigned)rpm_to_u16(g_fan_calibration.peak_rpm),
                      (unsigned)percent_from_ratio(g_manual_target));
+
+            /* 测速完成后切入温控 */
+            g_mode = CONTROL_MODE_TEMP;
+            emit_log("[mode]auto");
         }
     }
 
@@ -1760,6 +1918,7 @@ int main(void)
     board_init();
     pwm_init();
     tach_init();
+    temp_init();
     ssd1306_i2c_setup();
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 
@@ -1767,6 +1926,10 @@ int main(void)
 
     emit_log("[boot] Whisker Breeze firmware starting (%s)", __DATE__ " " __TIME__);
     power_update();
+    /* 上电先进入测速模式 */
+    g_mode = CONTROL_MODE_CALIB;
+    fan_calibration_reset();
+    emit_log("[mode]init calib");
     ch224_poll(CH224_POLL_INTERVAL_MS);
     ina226_update(INA226_POLL_INTERVAL_MS);
     log_pd_snapshot("boot");
@@ -1782,6 +1945,7 @@ int main(void)
         tach_update(LOOP_PERIOD_MS);
         ch224_poll(LOOP_PERIOD_MS);
         ina226_update(LOOP_PERIOD_MS);
+        temp_update(LOOP_PERIOD_MS);
         fan_update(LOOP_PERIOD_MS);
         poll_input();
         display_try_init();
