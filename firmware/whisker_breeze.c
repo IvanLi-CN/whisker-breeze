@@ -10,7 +10,10 @@ typedef int32_t fix16_t;
 #define FIX16_FRAC_BITS 16
 #define FIX16_ONE       (1 << FIX16_FRAC_BITS)
 
-#define SSD1306_128X64
+#define SSD1306_72X40
+
+#define DISP_ORIGIN_X 30
+#define DISP_ORIGIN_Y 14
 
 static bool g_display_error_seen = false;
 
@@ -30,7 +33,38 @@ static int ssd1306_quiet_printf(const char *fmt, ...)
 #include "../ch32fun/extralibs/ssd1306.h"
 
 extern int printf(const char *fmt, ...);
+static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y);
+
 int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
+
+static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
+{
+    for (uint8_t y = 0; y < SSD1306_H; y += 8) {
+        for (uint8_t x = 0; x < SSD1306_W; x += 8) {
+            uint8_t color = ((x / 8) ^ (y / 8)) & 1;
+            for (uint8_t yy = 0; yy < 8; ++yy) {
+                if ((y + yy) >= SSD1306_H) {
+                    break;
+                }
+                uint8_t row = origin_y + y + yy;
+                if (row >= SSD1306_H) {
+                    break;
+                }
+                for (uint8_t xx = 0; xx < 8; ++xx) {
+                    if ((x + xx) >= SSD1306_W) {
+                        break;
+                    }
+                    uint8_t col = origin_x + x + xx;
+                    if (col >= SSD1306_W) {
+                        break;
+                    }
+                    ssd1306_drawPixel(col, row, color);
+                }
+            }
+        }
+    }
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Hardware bindings                                                          */
@@ -1041,7 +1075,7 @@ static void display_render(void)
         return;
     }
 
-    char line[17];
+    char line[12];
     ssd1306_setbuf(0);
 
     uint16_t set_pct = percent_from_ratio(g_manual_target);
@@ -1049,22 +1083,22 @@ static void display_render(void)
     uint32_t rpm_now = g_fan.rpm;
     uint32_t rpm_peak = g_fan.rpm_max;
 
-    snprintf(line, sizeof line, "Set   %3u%%", (unsigned)set_pct);
-    ssd1306_drawstr(0, 0, line, 1);
+    snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
 
-    snprintf(line, sizeof line, "Out   %3u%%", (unsigned)out_pct);
-    ssd1306_drawstr(0, 8, line, 1);
+    snprintf(line, sizeof line, "Out %3u%%", (unsigned)out_pct);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 8, line, 1);
 
-    snprintf(line, sizeof line, "RPM   %4lu", (unsigned long)rpm_now);
-    ssd1306_drawstr(0, 16, line, 1);
+    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
 
-    snprintf(line, sizeof line, "Peak  %4lu", (unsigned long)rpm_peak);
-    ssd1306_drawstr(0, 24, line, 1);
+    snprintf(line, sizeof line, "Pk %4lu", (unsigned long)rpm_peak);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
-    snprintf(line, sizeof line, "PD %s 12V %s",
+    snprintf(line, sizeof line, "PD%s/12%s",
              g_pd.present ? "OK" : "--",
              g_pd.have_12v ? "OK" : "--");
-    ssd1306_drawstr(0, 40, line, 1);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
 
     ssd1306_refresh();
 }
@@ -1089,7 +1123,7 @@ static void display_try_init(void)
 
     g_display_probe_attempted = true;
     display_power(true);
-    Delay_Ms(30);
+    Delay_Ms(120);
 
     g_display_error_seen = false;
     if (ssd1306_i2c_init() == 0) {
@@ -1100,7 +1134,33 @@ static void display_try_init(void)
             ssd1306_setbuf(0);
             g_display_initialized = true;
             g_display_disabled_logged = false;
-            emit_log("[disp] ok");
+            emit_log("[disp] ok ack=%d w=%u h=%u offset=%u",
+                     probe_result,
+                     (unsigned)SSD1306_W,
+                     (unsigned)SSD1306_H,
+                     (unsigned)SSD1306_OFFSET);
+
+            /* Diagnostic patterns to prove RAM writes reach the glass. */
+            ssd1306_setbuf(0);
+            ssd1306_refresh();
+            emit_log("[disp] diag black");
+            Delay_Ms(40);
+
+            ssd1306_setbuf(1);
+            ssd1306_refresh();
+            emit_log("[disp] diag white");
+            Delay_Ms(40);
+
+            extern void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y);
+            ssd1306_fill_checker(0, 0);
+            ssd1306_refresh();
+            emit_log("[disp] diag checker");
+            Delay_Ms(100);
+
+            ssd1306_setbuf(0);
+            ssd1306_refresh();
+            emit_log("[disp] diag cleared");
+
             display_render();
             return;
         }

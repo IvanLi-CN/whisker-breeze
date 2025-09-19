@@ -21,7 +21,23 @@
 
 ### Display Power and Reset
 
-- SSD1306 reset (`RES`) is driven by PD0. VBAT switching is handled by PA1. The display uses I2C address 0x3C. A reset pulse of ≥3 µs with active-low polarity is required. Firmware should probe the display and gracefully skip display updates when absent.
+The Newvision N042-7240TSWEG01-H16 panel follows the SSD1306 reference design that separates the logic rail (`VDD`) from the high-side charge‑pump rail (`VBAT/VCC`). Table below documents how each critical pin from the datasheet (`docs/n042-7240tsweg01-h16-spec.md`) is wired on Whisker Breeze so the firmware and hardware teams share the same terminology.
+
+| Panel Pin | Datasheet Role | Board Net / Reference | Notes |
+| --- | --- | --- | --- |
+| VDD | 1.65–3.3 V logic supply | `3V3` | Always-on logic rail shared with the MCU. Power up before VBAT (Step 1 in §4.2.1). |
+| VSS | Logic ground | `GND` | Common return for logic and charge pump. |
+| VBAT | 3.5–4.2 V input for internal DC/DC (datasheet §3.3.1.2) | Switched rail downstream of PA1/`BAT` PMOS（板级实际用 3.3 V，标记为 `OLED_VBAT`） | 量产硬件中 VBAT 直接由 3V3 供给，未另行升压。虽然低于 datasheet 推荐的 3.5 V，下游面板在实验中仍可点亮，亮度与可用温度范围需在验证中确认。 |
+| VCC | Boost output / panel supply | 与 `OLED_VBAT` 同网，局部旁路 4.7 µF | 由于 VCC 与 VBAT 短接并固定在 3.3 V，内部电荷泵保持旁路模式；确保去耦贴近面板排线。 |
+| C1P / C1N | Flying capacitor for charge pump | `C1P` / `C1N` pads with 0.1 µF X5R | Orientation per Fig. 3-18 in datasheet. |
+| C2P / C2N | Flying capacitor for charge pump | `C2P` / `C2N` pads with 1 µF X7R | Provides second stage gain; keep traces short. |
+| VCOMH | COM bias output | `VCOMH` with 4.7 µF to GND | Matches datasheet recommendation for internal regulator stability. |
+| RES# | Active-low reset | `RES` (PD0) | Firmware guarantees ≥3 µs low pulse; hold low while VBAT is off. |
+| SDA | I²C data | `SDA` (PC1) | 4.7 kΩ pull-up to `3V3`. |
+| SCL | I²C clock | `SCL` (PC2) | 4.7 kΩ pull-up to `3V3`. |
+| D/C#, CS#, etc. | — | — | Not bonded on the I²C variant. |
+
+Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISPLAY OFF`, initialise, clear RAM, enable VBAT (by asserting PA1 low), wait ≥100 ms for the charge pump to stabilise, and finally send `DISPLAY ON`. Firmware already controls PA1 and PD0; this table clarifies which physical nets correspond to the datasheet pins so that electrical and software documentation stay consistent.
 
 ### Fan Drive and Tachometer
 
