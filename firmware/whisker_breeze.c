@@ -109,7 +109,7 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define FAN_CALIBRATION_DELTA_RPM     25u
 
 #ifndef INA226_I2C_ADDR
-#define INA226_I2C_ADDR           0x40u
+#define INA226_I2C_ADDR           0x44u
 #endif
 #ifndef INA226_SHUNT_MICRO_OHMS
 #define INA226_SHUNT_MICRO_OHMS   10000u   /* 10 mΩ shunt */
@@ -131,8 +131,13 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define INA226_ADDR_MIN         0x40u
 #define INA226_ADDR_MAX         0x4Fu
 #define INA226_CONFIG_CONTINUOUS 0x4127u
-
 #define INA226_ERROR_LOG_INTERVAL_MS 1000u
+
+#define INA226_MAX_DETECT_FAILURES     5u
+#define INA226_MAX_CONFIG_FAILURES     3u
+#define INA226_MAX_SAMPLE_FAILURES     3u
+#define INA226_PANIC_GRACE_MS          200u
+#define INA226_STARTUP_DELAY_MS        25u
 
 #define I2C1_SHARED_BUS_TARGET_HZ 400000u
 
@@ -204,6 +209,7 @@ typedef struct {
     int32_t current_ma;
     int32_t power_mw;
     uint32_t poll_timer_ms;
+    uint32_t detect_failures;
     uint32_t config_failures;
     uint32_t sample_failures;
     uint32_t last_error_report_ms;
@@ -292,6 +298,7 @@ static ina226_state_t g_ina = {
     .current_ma = 0,
     .power_mw = 0,
     .poll_timer_ms = 0,
+    .detect_failures = 0,
     .config_failures = 0,
     .sample_failures = 0,
     .last_error_report_ms = 0,
@@ -460,6 +467,35 @@ static void emit_log(const char *fmt, ...)
     printf("%s\r\n", line);
     while (!DebugPrintfBufferFree()) {
         poll_input();
+    }
+}
+
+static void panic(const char *fmt, ...)
+{
+    char message[160];
+    va_list args;
+    va_start(args, fmt);
+    int written = mini_vsnprintf(message, sizeof message, fmt, args);
+    va_end(args);
+
+    if (written < 0) {
+        message[0] = '\0';
+    } else if (written >= (int)sizeof message) {
+        written = (int)sizeof message - 1;
+        message[written] = '\0';
+    } else {
+        message[written] = '\0';
+    }
+
+    if (message[0] != '\0') {
+        emit_log("[panic] %s", message);
+    } else {
+        emit_log("[panic]");
+    }
+
+    __disable_irq();
+    for (;;) {
+        __NOP();
     }
 }
 
@@ -638,7 +674,7 @@ cleanup:
     return ack;
 }
 
-static void i2c1_scan_bus(bool force)
+static void __attribute__((unused)) i2c1_scan_bus(bool force)
 {
     uint32_t now = g_uptime_ms;
     if (!force && g_i2c_scan_last_ms != 0u) {
@@ -903,18 +939,17 @@ static bool ina226_detect_address(void)
         return true;
     }
 
-    for (uint8_t addr = INA226_ADDR_MIN; addr <= INA226_ADDR_MAX; ++addr) {
-        if (!i2c1_ping(addr)) {
-            continue;
-        }
-
-        g_ina.address = addr;
-        g_ina.address_valid = true;
-        emit_log("[ina]0x%02X", (unsigned)addr);
-        return true;
+    g_ina.address = INA226_I2C_ADDR;
+    if (!i2c1_ping(g_ina.address)) {
+        return false;
     }
 
-    return false;
+    g_ina.address_valid = true;
+    g_ina.detect_failures = 0u;
+    g_ina.config_failures = 0u;
+    g_ina.sample_failures = 0u;
+    emit_log("[ina]0x%02X", (unsigned)g_ina.address);
+    return true;
 }
 
 static bool ina226_configure(void)
@@ -937,16 +972,23 @@ static bool ina226_configure(void)
 static void ina226_update(uint32_t delta_ms)
 {
     if (!g_ina.address_valid) {
+        if (g_uptime_ms < INA226_STARTUP_DELAY_MS) {
+            return;
+        }
         if (!ina226_detect_address()) {
             g_ina.valid = false;
             g_ina.online_announced = false;
             g_ina.configured = false;
-            if (g_ina.config_failures < UINT32_MAX) {
-                g_ina.config_failures++;
+            if (g_ina.detect_failures < UINT32_MAX) {
+                g_ina.detect_failures++;
             }
             g_ina.raw_bus_reg = 0u;
+            g_ina.config_failures = 0u;
+            g_ina.sample_failures = 0u;
             ina226_report_error("detect");
-            i2c1_scan_bus(false);
+            if (g_ina.detect_failures >= INA226_MAX_DETECT_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+                panic("INA226 not responding @0x%02X", INA226_I2C_ADDR);
+            }
             return;
         }
     }
@@ -956,15 +998,19 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.valid = false;
             g_ina.online_announced = false;
             g_ina.address_valid = false;
+            g_ina.detect_failures = 0u;
             if (g_ina.config_failures < UINT32_MAX) {
                 g_ina.config_failures++;
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
-            i2c1_scan_bus(false);
+            if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+                panic("INA226 configure failed");
+            }
             return;
         }
         g_ina.configured = true;
+        g_ina.config_failures = 0u;
         g_ina.poll_timer_ms = 0u;
     }
 
@@ -987,6 +1033,8 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.online_announced = false;
         g_ina.configured = false;
         g_ina.address_valid = false;
+        g_ina.detect_failures = 0u;
+        g_ina.config_failures = 0u;
         g_ina.bus_voltage_mv = 0;
         g_ina.shunt_voltage_uw = 0;
         g_ina.current_ma = 0;
@@ -996,10 +1044,13 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.sample_failures++;
         }
         ina226_report_error("sample");
-        i2c1_scan_bus(false);
+        if (g_ina.sample_failures >= INA226_MAX_SAMPLE_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+            panic("INA226 read failed");
+        }
         return;
     }
 
+    g_ina.sample_failures = 0u;
     g_ina.raw_bus_reg = raw_bus;
 
     int32_t bus_mv = (int32_t)(((uint64_t)raw_bus * 1250u + 500u) / 1000u);
