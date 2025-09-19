@@ -4,7 +4,12 @@
 
 - `firmware/` hosts CH32 application sources, board configuration, and the primary `Makefile`; generated artefacts (`*.elf`, `*.bin`, `*.hex`, `*.map`) should be cleaned before committing.
 - `ch32fun/` is a git submodule delivering the hardware abstraction layer, build scripts, and the `minichlink` utility—run `git submodule update --init --recursive` after cloning or when toolchain files change.
-- `docs/` captures wiring notes, display datasheets, and hardware experiments; update it whenever peripherals, pin maps, or measurement procedures evolve.
+- `docs/` captures wiring notes, datasheets, and hardware experiments; update it whenever peripherals, pin maps, or measurement procedures evolve.
+  - Docs conventions:
+    - Place Markdown documents directly under `docs/`.
+    - Place all images under `docs/assets/` and reference them from Markdown as `assets/<filename>`.
+    - Avoid committing PDFs or intermediate conversion artefacts. Remove temporary folders such as `downloads/` after importing.
+    - Prefer descriptive filenames like `ch32v003-reference-manual.md`, `ch32v003-datasheet.md`.
 - The repository root `Makefile` proxies to `make -C firmware`; prefer it for quick builds from the top level.
 
 ## Build, Test, and Development Commands

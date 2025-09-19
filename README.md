@@ -6,6 +6,19 @@ Whisker Breeze is a CH32V003-based fan speed controller project bootstrapped wit
 
 - `firmware/` – application sources and build scripts.
 - `ch32fun/` – ch32fun submodule providing the minimal hardware support code and tooling.
+- `docs/` – project documentation and hardware notes. All images live in `docs/assets`.
+
+## Documentation
+
+- CH32V003 Reference Manual (Markdown)
+  - `docs/ch32v003-reference-manual.md`
+- CH32V003 Datasheet (Markdown)
+  - `docs/ch32v003-datasheet.md`
+
+Conventions
+- Place Markdown documents directly under `docs/`.
+- Place all images under `docs/assets/` and reference them as `assets/<filename>` from Markdown.
+- Do not commit intermediate conversion output (e.g., `downloads/`, extracted PDFs, or per-doc image folders).
 
 ## Getting Started
 
