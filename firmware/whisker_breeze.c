@@ -17,6 +17,8 @@ typedef int32_t fix16_t;
 
 static bool g_display_error_seen = false;
 
+/* (no extra test toggles; keep firmware minimal) */
+
 static int ssd1306_quiet_printf(const char *fmt, ...)
 {
     (void)fmt;
@@ -402,6 +404,8 @@ static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
 static uint32_t g_uptime_ms = 0;
 
+/* (diagnostic helpers removed to keep minimal behavior) */
+
 /* -------------------------------------------------------------------------- */
 /* Utility helpers                                                            */
 /* -------------------------------------------------------------------------- */
@@ -498,6 +502,11 @@ static void emit_log(const char *fmt, ...)
                   (unsigned long)seconds,
                   (unsigned long)millis,
                   buffer);
+
+    /* Minimal fix: if no debugger, skip logging to avoid blocking. */
+    if (!DidDebuggerAttach()) {
+        return;
+    }
 
     while (!DebugPrintfBufferFree()) {
         poll_input();
@@ -1028,7 +1037,8 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.config_failures = 0u;
             g_ina.sample_failures = 0u;
             ina226_report_error("detect");
-            if (g_ina.detect_failures >= INA226_MAX_DETECT_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+            if (g_ina.detect_failures >= INA226_MAX_DETECT_FAILURES &&
+                g_uptime_ms >= INA226_PANIC_GRACE_MS) {
                 panic("INA226 not responding @0x%02X", INA226_I2C_ADDR);
             }
             return;
@@ -1046,7 +1056,8 @@ static void ina226_update(uint32_t delta_ms)
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
-            if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+            if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES &&
+                g_uptime_ms >= INA226_PANIC_GRACE_MS) {
                 panic("INA226 configure failed");
             }
             return;
@@ -1086,7 +1097,8 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.sample_failures++;
         }
         ina226_report_error("sample");
-        if (g_ina.sample_failures >= INA226_MAX_SAMPLE_FAILURES && g_uptime_ms >= INA226_PANIC_GRACE_MS) {
+        if (g_ina.sample_failures >= INA226_MAX_SAMPLE_FAILURES &&
+            g_uptime_ms >= INA226_PANIC_GRACE_MS) {
             panic("INA226 read failed");
         }
         return;
@@ -1922,7 +1934,7 @@ int main(void)
     ssd1306_i2c_setup();
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 
-    (void)WaitForDebuggerToAttach(2000);
+    (void)WaitForDebuggerToAttach(13);
 
     emit_log("[boot] Whisker Breeze firmware starting (%s)", __DATE__ " " __TIME__);
     power_update();
