@@ -1,8 +1,8 @@
 # Whisker Breeze Fan Controller
 
-Whisker Breeze is a CH32V003‑based fan speed controller, bootstrapped with
+Whisker Breeze is a CH32V003-based fan speed controller, bootstrapped with
 [ch32fun](https://github.com/cnlohr/ch32fun). The initial firmware is a small
-“hello world”: it toggles a status LED on PC0 and prints a heartbeat string via
+"hello world": it toggles a status LED on PC0 and prints a heartbeat string via
 the ch32fun debug printf channel.
 
 ## Hardware
@@ -16,10 +16,10 @@ the ch32fun debug printf channel.
 
 ## Repository Layout
 
-- `firmware/` — application sources and build scripts.
-- `ch32fun/` — ch32fun submodule with minimal HAL and tooling (minichlink).
-- `pcb/` — PCB resources: schematic SVG and EasyEDA Pro project (see above).
-- `docs/` — documentation and hardware notes. Images in `docs/assets/`.
+- `firmware/` - application sources and build scripts.
+- `ch32fun/` - ch32fun submodule with minimal HAL and tooling (minichlink).
+- `pcb/` - PCB resources: schematic SVG and EasyEDA Pro project (see above).
+- `docs/` - documentation and hardware notes. Images in `docs/assets/`.
 
 ## Documentation
 
@@ -36,7 +36,7 @@ Docs conventions
 
 Prerequisites
 
-- RISC‑V GCC toolchain with `riscv64-unknown-elf-gcc` on `PATH`.
+- RISC-V GCC toolchain with `riscv64-unknown-elf-gcc` on `PATH`.
 - Git submodules initialized (ch32fun):
 
   ```sh
@@ -51,9 +51,9 @@ make        # rebuilds firmware and flashes (proxy to firmware/)
 
 Useful targets
 
-- `make flash` — forces rebuild then programs the board via minichlink.
-- `make clean` — removes build artefacts in `firmware/`.
-- `make attach` — opens a persistent minichlink debug session.
+- `make flash` - forces rebuild then programs the board via minichlink.
+- `make clean` - removes build artefacts in `firmware/`.
+- `make attach` - opens a persistent minichlink debug session.
 
 Notes
 
