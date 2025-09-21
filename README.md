@@ -11,14 +11,14 @@ the ch32fun debug printf channel.
 
   <img src="pcb/whisker-breeze-sch.svg" alt="Whisker Breeze schematic" width="900" />
 
-- LCSC/立创 EDA 专业版工程：
+- EasyEDA Pro project:
   [pcb/whisker-breeze.epro](pcb/whisker-breeze.epro)
 
 ## Repository Layout
 
 - `firmware/` — application sources and build scripts.
 - `ch32fun/` — ch32fun submodule with minimal HAL and tooling (minichlink).
-- `pcb/` — KiCad/立创 EDA 相关资源：原理图 SVG 与工程文件（见上）。
+- `pcb/` — PCB resources: schematic SVG and EasyEDA Pro project (see above).
 - `docs/` — documentation and hardware notes. Images in `docs/assets/`.
 
 ## Documentation
