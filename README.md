@@ -2,8 +2,10 @@
 
 Whisker Breeze is a CH32V003-based fan speed controller, bootstrapped with
 [ch32fun](https://github.com/cnlohr/ch32fun). The initial firmware is a small
-"hello world": it toggles a status LED on PC0 and prints a heartbeat string via
-the ch32fun debug printf channel.
+"hello world": it drives a status LED on PC6 (open‑drain, active‑low) and prints
+a heartbeat string via the ch32fun debug printf channel. After full
+initialization and fan tach calibration, the LED encodes fan speed every 4 s
+using 1–10 pulses (100 ms on, 200 ms off per pulse).
 
 ## Hardware
 

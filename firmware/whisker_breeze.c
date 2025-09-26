@@ -80,6 +80,7 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define PIN_FAN_TACH          PC4
 #define PIN_POWER_GOOD        PC7
 #define PIN_INA_INT           PC0
+#define PIN_STATUS_LED        PC6
 #define PIN_MODE_FAST         PD2
 #define PIN_MODE_SELECT       PD3
 #define PIN_MODE_SLOW         PD4
@@ -167,9 +168,14 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 
 #define LOG_SAMPLE_PERIOD_MS      1000u
 #define LOG_FORCE_INTERVAL_MS     5000u
-#define LOG_DELTA_TARGET_Q16      (FIX16_ONE / 50)  /* 0.02 */
-#define LOG_DELTA_DUTY_Q16        (FIX16_ONE / 50)  /* 0.02 */
-#define LOG_DELTA_RPM             50u
+/* Throttle deltas: require larger changes to log */
+#define LOG_DELTA_TARGET_Q16      (FIX16_ONE / 20)  /* 0.05 */
+#define LOG_DELTA_DUTY_Q16        (FIX16_ONE / 20)  /* 0.05 */
+#define LOG_DELTA_RPM             150u
+/* Hard minimum spacing between [fan] logs when not force-interval */
+#ifndef LOG_MIN_INTERVAL_MS
+#define LOG_MIN_INTERVAL_MS       250u
+#endif
 
 #define MODE_DEBOUNCE_TICKS       3u
 #define LOOP_PERIOD_MS            10u
@@ -1252,6 +1258,123 @@ static void fan_apply_pwm(fix16_t duty, uint32_t delta_ms)
 }
 
 /* -------------------------------------------------------------------------- */
+/* Status LED (PC6, open-drain, active-low)                                   */
+/* -------------------------------------------------------------------------- */
+/* LED timing (tunable) */
+#ifndef LED_PULSE_ON_MS
+#define LED_PULSE_ON_MS   20u
+#endif
+#ifndef LED_PULSE_OFF_MS
+#define LED_PULSE_OFF_MS  60u
+#endif
+#ifndef LED_CYCLE_MS
+#define LED_CYCLE_MS      4000u
+#endif
+
+typedef enum {
+    LED_BOOT_SOLID = 0,   /* Solid ON during boot/bring-up */
+    LED_PULSE_ON,         /* Inside a pulse: ON for LED_PULSE_ON_MS */
+    LED_PULSE_OFF,        /* Inter-pulse OFF for LED_PULSE_OFF_MS */
+    LED_GAP               /* Idle until LED_CYCLE_MS cycle ends */
+} led_state_t;
+
+static struct {
+    led_state_t state;
+    uint32_t    state_ms;
+    uint32_t    cycle_ms;         /* 0..4000 */
+    uint8_t     pulses_target;    /* 1..10 computed at cycle start */
+    uint8_t     pulses_emitted;   /* how many pulses emitted in this cycle */
+    bool        ready_started;    /* latched when pulse mode begins */
+} g_led = { .state = LED_BOOT_SOLID, .state_ms = 0, .cycle_ms = 0, .pulses_target = 1, .pulses_emitted = 0, .ready_started = false };
+
+static inline void led_on(void)  { funDigitalWrite(PIN_STATUS_LED, FUN_LOW); }
+static inline void led_off(void) { funDigitalWrite(PIN_STATUS_LED, FUN_HIGH); }
+
+static inline uint8_t clamp_u8(uint8_t v, uint8_t lo, uint8_t hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* LED 脉冲分级仅按当前占空比（Duty%）映射。*/
+static inline uint8_t led_pct_from_duty(void)
+{
+    return (uint8_t)percent_from_ratio(g_fan.current_duty); /* 0..100 */
+}
+
+static void led_update(uint32_t delta_ms)
+{
+    /* Determine readiness: VBUS valid and calibration completed with at least one RPM sample. */
+    bool system_ready = g_power.vbus_valid && g_fan_calibration.completed && g_fan.rpm_valid;
+
+    if (!g_led.ready_started) {
+        if (!system_ready) {
+            /* Boot/bring-up: solid ON (active-low). */
+            led_on();
+            return;
+        }
+        /* Transition to pulse mode on first ready. */
+        g_led.ready_started = true;
+        g_led.state = LED_PULSE_ON;
+        g_led.state_ms = 0;
+        g_led.cycle_ms = 0;
+        g_led.pulses_emitted = 0;
+        /* Compute initial pulses from RPM percentage (1..10). */
+        uint32_t pct = led_pct_from_duty();
+        uint8_t pulses = (uint8_t)((pct * 10u + 99u) / 100u); /* 0..10 -> round up per bin */
+        g_led.pulses_target = clamp_u8(pulses == 0 ? 1 : pulses, 1, 10);
+        emit_log("[led]%u", (unsigned)g_led.pulses_target);
+        led_on();
+        return;
+    }
+
+    /* Pulse mode running */
+    g_led.state_ms += delta_ms;
+    g_led.cycle_ms += delta_ms;
+
+    switch (g_led.state) {
+    case LED_BOOT_SOLID:
+        /* Should not stay here once ready_started is true */
+        led_on();
+        break;
+    case LED_PULSE_ON:
+        if (g_led.state_ms >= LED_PULSE_ON_MS) {
+            g_led.state = LED_PULSE_OFF;
+            g_led.state_ms = 0;
+            led_off();
+        }
+        break;
+    case LED_PULSE_OFF:
+        if (g_led.state_ms >= LED_PULSE_OFF_MS) {
+            g_led.pulses_emitted++;
+            g_led.state_ms = 0;
+            if (g_led.pulses_emitted < g_led.pulses_target) {
+                g_led.state = LED_PULSE_ON;
+                led_on();
+            } else {
+                g_led.state = LED_GAP;
+                led_off();
+            }
+        }
+        break;
+    case LED_GAP:
+        /* Wait for end of 4 s cycle. */
+        if (g_led.cycle_ms >= LED_CYCLE_MS) {
+            /* Start next cycle: recompute target pulses from newest RPM. */
+            g_led.cycle_ms = 0;
+            g_led.state = LED_PULSE_ON;
+            g_led.state_ms = 0;
+            g_led.pulses_emitted = 0;
+            uint32_t pct = led_pct_from_duty();
+            uint8_t pulses = (uint8_t)((pct * 10u + 99u) / 100u);
+            g_led.pulses_target = clamp_u8(pulses == 0 ? 1 : pulses, 1, 10);
+            emit_log("[led]%u", (unsigned)g_led.pulses_target);
+            led_on();
+        }
+        break;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Hardware init                                                              */
 /* -------------------------------------------------------------------------- */
 static void board_init(void)
@@ -1285,6 +1408,10 @@ static void board_init(void)
 
     funPinMode(PIN_FAN_TACH, GPIO_CFGLR_IN_PUPD);
     funDigitalWrite(PIN_FAN_TACH, FUN_HIGH);
+
+    /* Status LED: PC6, open-drain, active-low. Default ON at power-up. */
+    funPinMode(PIN_STATUS_LED, GPIO_CFGLR_OUT_10Mhz_OD);
+    funDigitalWrite(PIN_STATUS_LED, FUN_LOW);
 }
 
 static void pwm_init(void)
@@ -1820,6 +1947,12 @@ static void heartbeat_log(uint32_t tick_ms)
         }
     }
 
+    /* Rate-limit spontaneous logs: if not forced by interval, require a
+     * minimum spacing to avoid spamming during rapid RPM transitions. */
+    if (should_log && !interval_due && g_log.sample_accum < LOG_MIN_INTERVAL_MS) {
+        should_log = false;
+    }
+
     if (!should_log) {
         return;
     }
@@ -1909,6 +2042,7 @@ int main(void)
         poll_input();
         display_try_init();
         display_render();
+        led_update(LOOP_PERIOD_MS);
         heartbeat_log(LOOP_PERIOD_MS);
         Delay_Ms(LOOP_PERIOD_MS);
     }

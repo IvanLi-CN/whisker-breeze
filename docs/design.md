@@ -19,6 +19,21 @@
 
 ## Peripheral Interfaces
 
+### Status LED (PC6)
+
+- Location: testpad/marker `K`, MCU pin `PC6`.
+- Electrical: open‑drain output, external pull‑up to `3V3`, LED is active‑low.
+- Power‑up behavior: LED turns on at power‑up to indicate boot.
+- Ready behavior: once all modules are up and tach calibration has completed, the
+  LED switches to a speed display pattern with a 4 s cycle:
+  - One pulse = 默认 60 ms 亮、120 ms 灭（可通过 `LED_PULSE_ON_MS`、`LED_PULSE_OFF_MS` 宏配置；低电平点亮）。
+  - Fan speed 分级：仅按当前占空比 `Duty%` 进行 0–100% 归一化，并映射为 1–10 个脉冲。
+  - Speed normalization uses the peak RPM observed since boot (`rpm_max`); if no
+    valid RPM is available the LED remains solid on.
+
+Rationale: open‑drain keeps the pad tolerant of different LED wiring options and
+allows sharing with external pull‑ups without contention.
+
 ### Display Power and Reset
 
 The Newvision N042-7240TSWEG01-H16 panel follows the SSD1306 reference design that separates the logic rail (`VDD`) from the high-side charge‑pump rail (`VBAT/VCC`). Table below documents how each critical pin from the datasheet (`docs/n042-7240tsweg01-h16-spec.md`) is wired on Whisker Breeze so the firmware and hardware teams share the same terminology.
