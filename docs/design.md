@@ -46,7 +46,7 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 
 ### Current and Power Monitoring
 
-- INA226 is connected on I2C address 0x44 (7-bit). Shared bus speed is fixed at 400 kHz to satisfy INA226 and CH224Q timing. The shunt resistor is 10 mΩ. Firmware polls bus voltage, shunt current, and power every 200 ms and records results in the heartbeat log. Startup includes scanning 0x40–0x4F to confirm the active address. INA226 bus voltage readings ≥ ~11.5 V (RAW ≥ 9200) force the `12` status bit to true to indicate valid high-voltage input even if CH224Q negotiation fails.
+- INA226 is connected on I2C address 0x40 (7-bit). Shared bus speed is fixed at 400 kHz to satisfy INA226 and CH224Q timing. The shunt resistor is 10 mΩ. Firmware polls bus voltage, shunt current, and power every 200 ms and records results in the heartbeat log. INA226 bus voltage readings ≥ ~11.5 V (RAW ≥ 9200) force the `12` status bit to true to indicate valid high-voltage input even if CH224Q negotiation fails.
 
 ### USB Power Delivery Monitor
 

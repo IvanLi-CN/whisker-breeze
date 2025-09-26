@@ -123,7 +123,7 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define FAN_CALIBRATION_DELTA_RPM     25u
 
 #ifndef INA226_I2C_ADDR
-#define INA226_I2C_ADDR           0x44u
+#define INA226_I2C_ADDR           0x40u
 #endif
 #ifndef INA226_SHUNT_MICRO_OHMS
 #define INA226_SHUNT_MICRO_OHMS   10000u   /* 10 mΩ shunt */
@@ -142,16 +142,12 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define INA226_REG_CURRENT      0x04u
 #define INA226_REG_CALIBRATION  0x05u
 #define INA226_REG_MASK_ENABLE  0x06u
-#define INA226_ADDR_MIN         0x40u
-#define INA226_ADDR_MAX         0x4Fu
 #define INA226_CONFIG_CONTINUOUS 0x4127u
 #define INA226_ERROR_LOG_INTERVAL_MS 1000u
 
-#define INA226_MAX_DETECT_FAILURES     5u
 #define INA226_MAX_CONFIG_FAILURES     3u
 #define INA226_MAX_SAMPLE_FAILURES     3u
 #define INA226_PANIC_GRACE_MS          200u
-#define INA226_STARTUP_DELAY_MS        25u
 
 #define I2C1_SHARED_BUS_TARGET_HZ 400000u
 
@@ -223,12 +219,10 @@ typedef struct {
     int32_t current_ma;
     int32_t power_mw;
     uint32_t poll_timer_ms;
-    uint32_t detect_failures;
     uint32_t config_failures;
     uint32_t sample_failures;
     uint32_t last_error_report_ms;
     uint8_t address;
-    bool address_valid;
     uint16_t raw_bus_reg;
 } ina226_state_t;
 
@@ -322,12 +316,10 @@ static ina226_state_t g_ina = {
     .current_ma = 0,
     .power_mw = 0,
     .poll_timer_ms = 0,
-    .detect_failures = 0,
     .config_failures = 0,
     .sample_failures = 0,
     .last_error_report_ms = 0,
     .address = INA226_I2C_ADDR,
-    .address_valid = false,
     .raw_bus_reg = 0,
 };
 
@@ -396,7 +388,7 @@ static void fan_calibration_reset(void)
     g_manual_target = FIX16_ONE;
 }
 
-static uint32_t g_i2c_scan_last_ms = 0u;
+/* address scan removed; INA226 is fixed at INA226_I2C_ADDR */
 
 static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
@@ -695,64 +687,7 @@ static bool i2c1_wait_not_busy(void)
     return false;
 }
 
-static bool i2c1_ping(uint8_t addr)
-{
-    if (!i2c1_wait_not_busy()) {
-        return false;
-    }
-
-    bool ack = false;
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        goto cleanup;
-    }
-
-    I2C1->DATAR = (uint16_t)((uint16_t)addr << 1);
-    if (!i2c1_wait_flag(0x00070082u)) {
-        goto cleanup;
-    }
-
-    (void)I2C1->STAR1;
-    (void)I2C1->STAR2;
-    ack = true;
-
-cleanup:
-    I2C1->CTLR1 |= I2C_CTLR1_STOP;
-    if ((I2C1->STAR1 & I2C_STAR1_AF) != 0u) {
-        I2C1->STAR1 &= (uint16_t)~I2C_STAR1_AF;
-    }
-    return ack;
-}
-
-static void __attribute__((unused)) i2c1_scan_bus(bool force)
-{
-    uint32_t now = g_uptime_ms;
-    if (!force && g_i2c_scan_last_ms != 0u) {
-        uint32_t elapsed = now - g_i2c_scan_last_ms;
-        if (elapsed < INA226_ERROR_LOG_INTERVAL_MS) {
-            return;
-        }
-    }
-
-    g_i2c_scan_last_ms = (now == 0u) ? 1u : now;
-
-    emit_log("[i2c]scan");
-    uint32_t found = 0u;
-    for (uint8_t addr = 0x03u; addr <= 0x77u; addr++) {
-        if (!i2c1_ping(addr)) {
-            continue;
-        }
-        found++;
-        emit_log("[i2c]%02X", (unsigned)addr);
-    }
-
-    if (found == 0u) {
-        emit_log("[i2c]0");
-    }
-
-    emit_log("[i2c]done%lu", (unsigned long)found);
-}
+/* i2c1_scan_bus removed: address discovery not required */
 
 static bool i2c1_read_current_u8(uint8_t addr, uint8_t *value)
 {
@@ -959,17 +894,11 @@ static uint16_t ina226_compute_calibration(void)
 
 static bool ina226_write_register(uint8_t reg, uint16_t value)
 {
-    if (!g_ina.address_valid) {
-        return false;
-    }
     return i2c1_write_u16(g_ina.address, reg, value);
 }
 
 static bool ina226_read_register(uint8_t reg, uint16_t *value)
 {
-    if (!g_ina.address_valid) {
-        return false;
-    }
     return i2c1_read_u16(g_ina.address, reg, value);
 }
 
@@ -978,30 +907,12 @@ static void ina226_report_error(const char *stage)
     uint32_t now = g_uptime_ms;
     if (g_ina.last_error_report_ms == 0u ||
         (now - g_ina.last_error_report_ms) >= INA226_ERROR_LOG_INTERVAL_MS) {
-        uint8_t addr = g_ina.address_valid ? g_ina.address : INA226_I2C_ADDR;
-        emit_log("[ina]%s fail 0x%02X", stage, (unsigned)addr);
+        emit_log("[ina]%s fail 0x%02X", stage, (unsigned)g_ina.address);
         g_ina.last_error_report_ms = (now == 0u) ? 1u : now;
     }
 }
 
-static bool ina226_detect_address(void)
-{
-    if (g_ina.address_valid) {
-        return true;
-    }
-
-    g_ina.address = INA226_I2C_ADDR;
-    if (!i2c1_ping(g_ina.address)) {
-        return false;
-    }
-
-    g_ina.address_valid = true;
-    g_ina.detect_failures = 0u;
-    g_ina.config_failures = 0u;
-    g_ina.sample_failures = 0u;
-    emit_log("[ina]0x%02X", (unsigned)g_ina.address);
-    return true;
-}
+/* ina226_detect_address removed: fixed address is used */
 
 static bool ina226_configure(void)
 {
@@ -1022,35 +933,10 @@ static bool ina226_configure(void)
 
 static void ina226_update(uint32_t delta_ms)
 {
-    if (!g_ina.address_valid) {
-        if (g_uptime_ms < INA226_STARTUP_DELAY_MS) {
-            return;
-        }
-        if (!ina226_detect_address()) {
-            g_ina.valid = false;
-            g_ina.online_announced = false;
-            g_ina.configured = false;
-            if (g_ina.detect_failures < UINT32_MAX) {
-                g_ina.detect_failures++;
-            }
-            g_ina.raw_bus_reg = 0u;
-            g_ina.config_failures = 0u;
-            g_ina.sample_failures = 0u;
-            ina226_report_error("detect");
-            if (g_ina.detect_failures >= INA226_MAX_DETECT_FAILURES &&
-                g_uptime_ms >= INA226_PANIC_GRACE_MS) {
-                panic("INA226 not responding @0x%02X", INA226_I2C_ADDR);
-            }
-            return;
-        }
-    }
-
     if (!g_ina.configured) {
         if (!ina226_configure()) {
             g_ina.valid = false;
             g_ina.online_announced = false;
-            g_ina.address_valid = false;
-            g_ina.detect_failures = 0u;
             if (g_ina.config_failures < UINT32_MAX) {
                 g_ina.config_failures++;
             }
@@ -1085,8 +971,7 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.valid = false;
         g_ina.online_announced = false;
         g_ina.configured = false;
-        g_ina.address_valid = false;
-        g_ina.detect_failures = 0u;
+        /* keep fixed address; do not reset */
         g_ina.config_failures = 0u;
         g_ina.bus_voltage_mv = 0;
         g_ina.shunt_voltage_uw = 0;
