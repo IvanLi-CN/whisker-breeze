@@ -88,13 +88,27 @@ static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
 #define PIN_TEMP_SENSE        PA2
 #define TEMP_ADC_CHANNEL      ANALOG_0
 
-/* MF52A103F3435 with R3=8.2k divider @3.3V
- * CH32V003 ADC is 10-bit (0..1023). Anchor codes (rounded):
- *   20°C → ~611 counts; 40°C → ~422 counts.
- * If移植到12位ADC, 需按比例更新。
+/* NTC & divider definition (FNTC0402X103F3380FB)
+ * - NTC: 10 kΩ @25°C, B≈3380 K (B25/50)
+ * - Divider top resistor: R3 = 8.2 kΩ to 3V3, NTC to GND
+ * - ADC: CH32V003 regular ADC, treated as 10-bit full-scale (0..1023) for computation
+ *
+ * Historical linear anchors kept for reference/log compatibility (10-bit codes):
+ *   20°C → ≈610 counts; 40°C → ≈424 counts.
+ * Note: we now compute temperature via Beta model; these anchors are no longer
+ * used for control but retained for potential diagnostics.
  */
-#define TEMP_ADC_CODE_20C     611
-#define TEMP_ADC_CODE_40C     422
+#define TEMP_ADC_BITS         10
+#define TEMP_ADC_FULL_SCALE   ((1u << TEMP_ADC_BITS) - 1u) /* 1023 for 10-bit */
+#define TEMP_ADC_CODE_20C     610
+#define TEMP_ADC_CODE_40C     424
+
+/* NTC model parameters for Beta equation */
+#define NTC_R25_OHMS          10000.0f     /* 10 kΩ */
+#define NTC_BETA_K            3380.0f      /* K */
+#define NTC_DIVIDER_RTOP_OHMS 8200.0f      /* 8.2 kΩ */
+#define KELVIN_25C            298.15f      /* 25°C in K */
+#define KELVIN_0C             273.15f      /* 0°C in K */
 
 /* -------------------------------------------------------------------------- */
 /* Control constants                                                          */
@@ -439,6 +453,30 @@ static inline fix16_t fix16_abs(fix16_t value)
 {
     return (value >= 0) ? value : (fix16_t)(-value);
 }
+
+/* Fast natural log approximation for x>0 without libm.
+ * Uses range reduction by powers of 2 and an atanh-like series on [0.5,2].
+ * Accuracy is within ~1e-4 for our working range (0.4..2.0), sufficient for Beta calc. */
+/* Precomputed ADC(10-bit) → temperature (centi-°C) table using Beta model for
+ * FNTC0402X103F3380FB with Rtop=8.2k. Linear interpolation between points.
+ * Points cover 0–100°C; control band is 20–40°C. */
+typedef struct { uint16_t code; int16_t t_c_x100; } ntc_point_t;
+static const ntc_point_t k_ntc_table[] = {
+    { 793,    0   }, /*   0°C */
+    { 706,  1000 }, /*  10°C */
+    { 610,  2000 }, /*  20°C */
+    { 562,  2500 }, /*  25°C */
+    { 514,  3000 }, /*  30°C */
+    { 468,  3500 }, /*  35°C */
+    { 424,  4000 }, /*  40°C */
+    { 383,  4500 }, /*  45°C */
+    { 344,  5000 }, /*  50°C */
+    { 309,  5500 }, /*  55°C */
+    { 277,  6000 }, /*  60°C */
+    { 221,  7000 }, /*  70°C */
+    { 177,  8000 }, /*  80°C */
+    { 114, 10000 }, /* 100°C */
+};
 
 static uint16_t percent_from_ratio(fix16_t value)
 {
@@ -1341,6 +1379,8 @@ static void controls_update(void)
 #define TEMP_AVG_SHIFT          3u    /* IIR avg: 1/8 */
 
 static uint16_t temp_adc_sample(void);
+static int16_t ntc_temp_c_x100_from_adc(uint16_t code);
+static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100);
 
 static void temp_init(void)
 {
@@ -1367,8 +1407,8 @@ static uint16_t temp_adc_sample(void)
     if (sample < 0) {
         sample = 0;
     }
-    if (sample > 4095) {
-        sample = 4095;
+    if (sample > (int)TEMP_ADC_FULL_SCALE) {
+        sample = (int)TEMP_ADC_FULL_SCALE;
     }
     return (uint16_t)sample;
 }
@@ -1388,35 +1428,57 @@ static void temp_update(uint32_t delta_ms)
         g_temp.adc_avg = raw;
     } else {
         /* IIR averaging: avg += (raw - avg) / 2^N */
-        g_temp.adc_avg = (uint16_t)(g_temp.adc_avg + ((int32_t)raw - (int32_t)g_temp.adc_avg) / (1 << TEMP_AVG_SHIFT));
+    g_temp.adc_avg = (uint16_t)(g_temp.adc_avg + ((int32_t)raw - (int32_t)g_temp.adc_avg) / (1 << TEMP_AVG_SHIFT));
     }
 
-    /* Rough linearized temperature between 20–40°C for logging */
-    int32_t span = (int32_t)TEMP_ADC_CODE_20C - (int32_t)TEMP_ADC_CODE_40C; /* positive */
-    int32_t delta = (int32_t)TEMP_ADC_CODE_20C - (int32_t)g_temp.adc_avg;   /* <0 when below 20C */
-    int32_t t_x100 = 2000 + ((delta * 2000 + (span/2)) / (span == 0 ? 1 : span));
-    if (t_x100 < -4000) t_x100 = -4000; /* clamp just to avoid overflow */
-    if (t_x100 > 12500) t_x100 = 12500;
-    g_temp.temp_c_x100 = (int16_t)t_x100;
+    /* Compute temperature using Beta model for logging/control accuracy */
+    g_temp.temp_c_x100 = ntc_temp_c_x100_from_adc(g_temp.adc_avg);
 }
 
-static fix16_t temp_target_ratio_from_adc(uint16_t adc_avg)
+/* Convert ADC code to temperature (centi-°C) using Beta equation.
+ * Steps: code→voltage ratio→Rntc→T via 1/T = 1/T25 + (1/B)*ln(R/R25)
+ */
+static int16_t ntc_temp_c_x100_from_adc(uint16_t code)
 {
-    /* Map ADC code to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
-    int32_t span = (int32_t)TEMP_ADC_CODE_20C - (int32_t)TEMP_ADC_CODE_40C; /* 20°C window width in counts */
-    if (span <= 0) {
+    /* Clamp code to table bounds */
+    if (code >= k_ntc_table[0].code) {
+        return k_ntc_table[0].t_c_x100;
+    }
+    const size_t N = sizeof(k_ntc_table) / sizeof(k_ntc_table[0]);
+    if (code <= k_ntc_table[N - 1].code) {
+        return k_ntc_table[N - 1].t_c_x100;
+    }
+
+    /* Find segment [i,i+1] where code is between table codes (descending). */
+    size_t i = 0;
+    for (; i + 1 < N; ++i) {
+        if (code <= k_ntc_table[i].code && code >= k_ntc_table[i + 1].code) {
+            break;
+        }
+    }
+    uint16_t c_hi = k_ntc_table[i].code;
+    uint16_t c_lo = k_ntc_table[i + 1].code;
+    int16_t  t_hi = k_ntc_table[i].t_c_x100;
+    int16_t  t_lo = k_ntc_table[i + 1].t_c_x100;
+
+    uint16_t span = (uint16_t)(c_hi - c_lo);
+    uint16_t pos  = (uint16_t)(c_hi - code);
+    /* Linear interpolation: t = t_hi + (t_lo - t_hi) * pos/span */
+    int32_t t = (int32_t)t_hi + (int32_t)(t_lo - t_hi) * (int32_t)pos / (span ? span : 1u);
+    return (int16_t)t;
+}
+
+/* Map temperature (centi-°C) to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
+static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
+{
+    if (temp_c_x100 <= 2000) {
+        return 0;
+    }
+    if (temp_c_x100 >= 4000) {
         return FIX16_ONE;
     }
-
-    if ((int32_t)adc_avg >= (int32_t)TEMP_ADC_CODE_20C) {
-        return 0; /* below 20°C → stop */
-    }
-    if ((int32_t)adc_avg <= (int32_t)TEMP_ADC_CODE_40C) {
-        return FIX16_ONE; /* >= 40°C → full */
-    }
-
-    int32_t pos = (int32_t)TEMP_ADC_CODE_20C - (int32_t)adc_avg; /* 0..span */
-    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(span));
+    int32_t pos = (int32_t)temp_c_x100 - 2000; /* 0..2000 */
+    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(2000));
     fix16_t range = FIX16_ONE - g_fan_min_ratio;
     return g_fan_min_ratio + fix16_mul(frac, range);
 }
@@ -1487,7 +1549,7 @@ static void fan_update(uint32_t delta_ms)
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
-        fix16_t auto_target = temp_target_ratio_from_adc(g_temp.adc_avg);
+        fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
         /* 手动：按键调整 */

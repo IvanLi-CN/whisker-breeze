@@ -119,7 +119,7 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 
 ## Outstanding Information Required
 
-1. Finalize the TS input front-end: confirm NTC value (10 kΩ @ 25 °C), β = 3950, bias network (3V3 via 8.2 kΩ), and any RC filtering (≈0.55 ms with 100 nF).
+1. Finalize the TS input front-end: confirm NTC value (10 kΩ @ 25 °C), β ≈ 3380 (FNTC0402X103F3380FB), bias network (3V3 via 8.2 kΩ), and any RC filtering (≈0.55 ms with 100 nF).
 2. Verify INT source device, polarity (low-active), and pull-up value (4.7 kΩ to 3V3).
 3. Confirm SSD1306 reset polarity (expected active low) and timing.
 4. Validate TM-2024A wiring for SLOW/MODE/FAST, including optional press detection and pull-up strategy.
