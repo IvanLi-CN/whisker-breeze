@@ -478,6 +478,12 @@ static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
 static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
+/* 屏幕省电：默认亮屏，上电后 5 s 无按键则熄屏；任意按键唤醒。
+ * - 熄屏下，按中键仅唤醒且消耗该次事件；其它键唤醒且不消耗。
+ */
+#define DISPLAY_SLEEP_TIMEOUT_MS 5000u
+static bool     g_display_awake = true;     /* 运行期亮/熄屏状态 */
+static uint32_t g_display_idle_ms = 0u;     /* 距离上次有效输入的空闲时间 */
 /* g_uptime_ms moved above into the time base section */
 
 /* (diagnostic helpers removed to keep minimal behavior) */
@@ -1173,9 +1179,46 @@ static void display_power(bool enable)
     }
 }
 
+/* 进入/退出熄屏：用 0xAE/0xAF 控制控制器显示输出 */
+static void display_set_awake(bool awake)
+{
+    if (g_display_awake == awake) {
+        return;
+    }
+    g_display_awake = awake;
+    if (!g_display_initialized) {
+        return;
+    }
+    if (awake) {
+        (void)ssd1306_cmd(SSD1306_DISPLAYON);
+    } else {
+        (void)ssd1306_cmd(SSD1306_DISPLAYOFF);
+    }
+}
+
+/* 根据空闲时间自动熄屏/保持亮屏 */
+static void display_idle_update(uint32_t delta_ms)
+{
+    /* 任一稳定按键按下 → 认为有持续输入，重置空闲计时 */
+    if (g_controls.decrease_input.stable_state ||
+        g_controls.increase_input.stable_state ||
+        g_controls.hold_input.stable_state) {
+        g_display_idle_ms = 0u;
+    } else {
+        if (g_display_idle_ms < UINT32_MAX - delta_ms)
+            g_display_idle_ms += delta_ms;
+        else
+            g_display_idle_ms = UINT32_MAX;
+    }
+
+    if (g_display_awake && g_display_idle_ms >= DISPLAY_SLEEP_TIMEOUT_MS) {
+        display_set_awake(false);
+    }
+}
+
 static void display_render(void)
 {
-    if (!g_display_initialized) {
+    if (!g_display_initialized || !g_display_awake) {
         return;
     }
     /* Throttle refresh to avoid visible flicker when numbers fluctuate. */
@@ -1271,13 +1314,13 @@ static void display_try_init(void)
             ssd1306_setbuf(0);
             g_display_initialized = true;
             g_display_disabled_logged = false;
-            emit_log("[disp] ok ack=%d w=%u h=%u offset=%u",
-                     probe_result,
-                     (unsigned)SSD1306_W,
-                     (unsigned)SSD1306_H,
-                     (unsigned)SSD1306_OFFSET);
+            emit_log("[disp]ok");
 
-            /* 初始化成功，后续由常规渲染路径 display_render() 输出内容。*/
+            /* 初始化成功，按当前逻辑状态决定是否点亮。*/
+            if (!g_display_awake) {
+                (void)ssd1306_cmd(SSD1306_DISPLAYOFF);
+            }
+            /* 后续由常规渲染路径 display_render() 输出内容。*/
             return;
         }
     }
@@ -1611,20 +1654,42 @@ static void controls_update(void)
 
     debounce_update(&g_controls.decrease_input, dec_pressed);
     debounce_update(&g_controls.increase_input, inc_pressed);
-    bool changed = debounce_update(&g_controls.hold_input, hold_pressed);
+    debounce_update(&g_controls.hold_input, hold_pressed);
 
-    /* Rising edge on MODE → 只在温控/手动间切换；测速模式下无效 */
+    /* 基于稳定态计算上升沿，用于唤醒与模式切换判定 */
+    static bool s_last_dec = false;
+    static bool s_last_inc = false;
     static bool s_last_hold = false;
-    if (changed) {
-        bool now = g_controls.hold_input.stable_state;
-        if (now && !s_last_hold) {
-            if (g_mode != CONTROL_MODE_CALIB) {
-                g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
-                emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
-            }
+
+    bool dec_now = g_controls.decrease_input.stable_state;
+    bool inc_now = g_controls.increase_input.stable_state;
+    bool hold_now = g_controls.hold_input.stable_state;
+
+    bool dec_rise = (!s_last_dec) && dec_now;
+    bool inc_rise = (!s_last_inc) && inc_now;
+    bool hold_rise = (!s_last_hold) && hold_now;
+
+    /* 熄屏下：任意键上升沿立即点亮；中键事件被消耗，其它键不消耗 */
+    if (!g_display_awake && (dec_rise || inc_rise || hold_rise)) {
+        display_set_awake(true);
+        g_display_idle_ms = 0u;
+        if (hold_rise) {
+            /* 吞掉中键的这次上升沿，不进行模式切换 */
+            hold_rise = false;
         }
-        s_last_hold = now;
     }
+
+    /* 亮屏时，处理中键的模式切换（仅测速完成后允许） */
+    if (hold_rise) {
+        if (g_mode != CONTROL_MODE_CALIB) {
+            g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+            emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
+        }
+    }
+
+    s_last_dec = dec_now;
+    s_last_inc = inc_now;
+    s_last_hold = hold_now;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2281,6 +2346,7 @@ int main(void)
         fan_update(delta_ms);
         poll_input();
         display_try_init();
+        display_idle_update(delta_ms);
         display_render();
         led_update(delta_ms);
         heartbeat_log(delta_ms);
