@@ -10,10 +10,21 @@ typedef int32_t fix16_t;
 #define FIX16_FRAC_BITS 16
 #define FIX16_ONE       (1 << FIX16_FRAC_BITS)
 
-#define SSD1306_72X40
+/* Use custom 72x40 with column offset 30 to align (30,14) origin */
+#undef SSD1306_72X40
+#define SSD1306_CUSTOM
+#define SSD1306_W      72
+#define SSD1306_H      40
+#define SSD1306_OFFSET 30
+/* 严格对齐“起始地址偏移版”参考：纵向偏移 0x0C，列起点偏移列=28（低0x0C/高0x11） */
+#define SSD1306_VOFFSET 12
 
-#define DISP_ORIGIN_X 30
-#define DISP_ORIGIN_Y 14
+/*
+ * 逻辑坐标从 (0,0) 开始，实际写入时通过列偏移=30、行偏移=14 映射到玻璃。
+ * 注意：为了避免重复偏移，渲染接口全部以 (0,0) 作为原点。
+ */
+#define DISP_ORIGIN_X 0
+#define DISP_ORIGIN_Y 0
 
 static bool g_display_error_seen = false;
 
@@ -34,38 +45,50 @@ static int ssd1306_quiet_printf(const char *fmt, ...)
 #undef printf
 #include "../ch32fun/extralibs/ssd1306.h"
 
-extern int printf(const char *fmt, ...);
-static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y);
-
-int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
-
-static void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y)
+static void ssd1306_flush_window(void)
 {
-    for (uint8_t y = 0; y < SSD1306_H; y += 8) {
-        for (uint8_t x = 0; x < SSD1306_W; x += 8) {
-            uint8_t color = ((x / 8) ^ (y / 8)) & 1;
-            for (uint8_t yy = 0; yy < 8; ++yy) {
-                if ((y + yy) >= SSD1306_H) {
-                    break;
-                }
-                uint8_t row = origin_y + y + yy;
-                if (row >= SSD1306_H) {
-                    break;
-                }
-                for (uint8_t xx = 0; xx < 8; ++xx) {
-                    if ((x + xx) >= SSD1306_W) {
-                        break;
-                    }
-                    uint8_t col = origin_x + x + xx;
-                    if (col >= SSD1306_W) {
-                        break;
-                    }
-                    ssd1306_drawPixel(col, row, color);
-                }
+    /* 完全复刻“起始地址偏移版”风格：
+     * - 页面寻址模式（0x20,0x02）
+     * - 每页先发：0xB0|page，然后列起点用低列0x0C + 高列0x11 → 列地址28
+     * - 每页写100字节（28..127）。其中可见玻璃72列位于索引2..73。
+     * - 垂直偏移 0x0C 由控制器内部完成，我们缓冲仍按 page=0..4 线性布局即可。
+     */
+    uint8_t line[100];
+    for (uint8_t p = 0; p < 5; ++p) {
+        /* 组装一页100列数据，逻辑72列映射到 line[2..73]，左右补0 */
+        memset(line, 0, sizeof line);
+        for (uint16_t xi = 0; xi < SSD1306_W; ++xi) {
+            uint16_t addr = xi + (uint16_t)SSD1306_W * p; /* 直接取本页72字节 */
+            uint8_t v = ssd1306_buffer[addr];
+            /* 放到列28起的窗口中：28 对应 line[0]，所以 30->line[2] */
+            uint16_t out_idx = (uint16_t)xi + 2; /* 0..71 → 2..73 */
+            if (out_idx < sizeof line) {
+                line[out_idx] = v;
             }
+        }
+
+        /* 设置页+列指针并发送本页 */
+        ssd1306_cmd(0xB0 | p);
+        ssd1306_cmd(0x0C); /* low col = 12 (0x0C) */
+        ssd1306_cmd(0x11); /* high col = 1  (0x11) */
+
+        uint16_t i = 0;
+        while (i < sizeof line) {
+            uint16_t rem = (uint16_t)sizeof line - i;
+            uint8_t chunk = (rem > SSD1306_PSZ) ? SSD1306_PSZ : (uint8_t)rem;
+            ssd1306_data(&line[i], chunk);
+            i += chunk;
         }
     }
 }
+
+extern int printf(const char *fmt, ...);
+/* 测试绘图与预热接口移除（量产不需要）。 */
+static void ssd1306_init_72x40_custom(void);
+
+int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
+
+/* 无 */
 
 
 /* -------------------------------------------------------------------------- */
@@ -1095,11 +1118,15 @@ static bool i2c1_read_u8(uint8_t addr, uint8_t reg, uint8_t *value)
 /* -------------------------------------------------------------------------- */
 static void display_power(bool enable)
 {
-    funDigitalWrite(PIN_DISPLAY_PWR, enable ? FUN_LOW : FUN_HIGH);
-    funDigitalWrite(PIN_DISPLAY_RESET, enable ? FUN_LOW : FUN_HIGH);
+    /* Requirement: BAT must be held low (enable) at all times. */
     if (enable) {
+        funDigitalWrite(PIN_DISPLAY_PWR, FUN_LOW);   /* BAT low: enable */
+        funDigitalWrite(PIN_DISPLAY_RESET, FUN_LOW); /* hold reset */
         Delay_Ms(5);
         funDigitalWrite(PIN_DISPLAY_RESET, FUN_HIGH);
+    } else {
+        /* Keep BAT asserted low; do not disable power. */
+        funDigitalWrite(PIN_DISPLAY_PWR, FUN_LOW);
     }
 }
 
@@ -1134,7 +1161,7 @@ static void display_render(void)
              g_pd.have_12v ? "OK" : "--");
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
 
-    ssd1306_refresh();
+    ssd1306_flush_window();
 }
 
 static void display_try_init(void)
@@ -1164,7 +1191,8 @@ static void display_try_init(void)
         const uint8_t probe_cmd = 0xAE; /* Display OFF */
         int probe_result = ssd1306_pkt_send(&probe_cmd, 1, 1);
         if (!g_display_error_seen && probe_result == 0) {
-            ssd1306_init();
+            /* 使用 72x40 专用初始化序列：多路复用=0x27、COMpins=0x12、偏移Y=14、列偏移=30 */
+            ssd1306_init_72x40_custom();
             ssd1306_setbuf(0);
             g_display_initialized = true;
             g_display_disabled_logged = false;
@@ -1174,28 +1202,7 @@ static void display_try_init(void)
                      (unsigned)SSD1306_H,
                      (unsigned)SSD1306_OFFSET);
 
-            /* Diagnostic patterns to prove RAM writes reach the glass. */
-            ssd1306_setbuf(0);
-            ssd1306_refresh();
-            emit_log("[disp] diag black");
-            Delay_Ms(40);
-
-            ssd1306_setbuf(1);
-            ssd1306_refresh();
-            emit_log("[disp] diag white");
-            Delay_Ms(40);
-
-            extern void ssd1306_fill_checker(uint8_t origin_x, uint8_t origin_y);
-            ssd1306_fill_checker(0, 0);
-            ssd1306_refresh();
-            emit_log("[disp] diag checker");
-            Delay_Ms(100);
-
-            ssd1306_setbuf(0);
-            ssd1306_refresh();
-            emit_log("[disp] diag cleared");
-
-            display_render();
+            /* 初始化成功，后续由常规渲染路径 display_render() 输出内容。*/
             return;
         }
     }
@@ -1210,6 +1217,52 @@ static void display_try_init(void)
         emit_log("[disp] SSD1306 missing, disabled");
     }
 }
+
+/* -------------------------------------------------------------------------- */
+/* OLED: 专用初始化 + 预热填充                                                 */
+/* -------------------------------------------------------------------------- */
+static void ssd1306_init_72x40_custom(void)
+{
+    /* 完全对齐参考示例（起始地址偏移版） */
+    ssd1306_cmd(SSD1306_DISPLAYOFF);              // 0xAE
+    ssd1306_cmd(SSD1306_SETDISPLAYCLOCKDIV);      // 0xD5
+    ssd1306_cmd(0xF0);
+
+    ssd1306_cmd(SSD1306_SETMULTIPLEX);            // 0xA8
+    ssd1306_cmd(SSD1306_H - 1);                   // 0x27 (40 rows)
+
+    ssd1306_cmd(SSD1306_SETDISPLAYOFFSET);        // 0xD3
+    ssd1306_cmd(SSD1306_VOFFSET);                 // 0x0C
+
+    ssd1306_cmd(SSD1306_SETSTARTLINE | 0x00);     // 0x40
+    ssd1306_cmd(SSD1306_CHARGEPUMP);              // 0x8D
+    ssd1306_cmd(0x14);
+
+    ssd1306_cmd(SSD1306_MEMORYMODE);              // 0x20
+    ssd1306_cmd(0x02);                             // Page Addressing Mode
+
+    ssd1306_cmd(SSD1306_SEGREMAP | 0x01);         // 0xA1
+    ssd1306_cmd(SSD1306_COMSCANDEC);              // 0xC8
+
+    ssd1306_cmd(SSD1306_SETCOMPINS);              // 0xDA
+    ssd1306_cmd(0x12);
+
+    ssd1306_cmd(0xAD);                            // Internal IREF
+    ssd1306_cmd(0x30);
+
+    ssd1306_cmd(SSD1306_SETCONTRAST);             // 0x81
+    ssd1306_cmd(0xFF);
+    ssd1306_cmd(SSD1306_SETPRECHARGE);            // 0xD9
+    ssd1306_cmd(0x22);
+    ssd1306_cmd(SSD1306_SETVCOMDETECT);           // 0xDB
+    ssd1306_cmd(0x20);
+
+    ssd1306_cmd(SSD1306_DISPLAYALLON_RESUME);     // 0xA4
+    ssd1306_cmd(SSD1306_NORMALDISPLAY);           // 0xA6
+    ssd1306_cmd(SSD1306_DISPLAYON);               // 0xAF
+}
+
+/* 预热填充与测试输出已移除，保持量产固件最小化。 */
 
 /* -------------------------------------------------------------------------- */
 /* PWM helpers                                                                */
