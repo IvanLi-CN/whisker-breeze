@@ -155,6 +155,22 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define FAN_DEFAULT_MIN_RATIO_Q16     ((fix16_t)((((uint64_t)FAN_DEFAULT_MIN_RPM) << FIX16_FRAC_BITS) / (FAN_DEFAULT_MAX_RPM)))
 #define FAN_RPM_GLITCH_MIN_BASE       300u
 #define FAN_RPM_GLITCH_UPPER_RPM      4500u
+
+/* Tach glitch rejection: ignore edges closer than half of the theoretical
+ * period at max RPM. Timer runs at FAN_TACH_TIMER_CLOCK_HZ and input has
+ * FAN_TACH_PULSES_PER_REV pulses per revolution. */
+#define TACH_MIN_VALID_TICKS ( (uint16_t)( ((60u * (uint32_t)FAN_TACH_TIMER_CLOCK_HZ) / ((uint32_t)FAN_TACH_PULSES_PER_REV * (uint32_t)FAN_TACH_MAX_RPM)) / 2u ) )
+
+/* After accepting a period, ignore subsequent edges that arrive too soon
+ * relative to that period (adaptive blanking). */
+#define TACH_EDGE_MIN_PCT          60u  /* require >=60% of last good period */
+
+/* RPM acceptance window relative to last good sample (percent). Values
+ * outside this window require short confirmation before acceptance. */
+#define RPM_ACCEPT_UP_PCT          160u  /* +60% step allowed immediately */
+#define RPM_ACCEPT_DOWN_PCT        60u   /* -40% dip allowed immediately */
+#define RPM_CANDIDATE_NEAR_PCT     10u   /* candidate consolidation window */
+#define RPM_LP_SHIFT                2u    /* IIR: new = old + (x-old)/4 */
 #define INA226_12V_RAW_THRESHOLD      9200u   /* 11.5 V / 1.25 mV */
 #define FAN_CALIBRATION_STABLE_MS     500u
 #define FAN_CALIBRATION_MIN_MS        2000u
@@ -226,6 +242,7 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define CH224_STATUS_PD_ACT       (1u << 3)
 
 #define CH224_POLL_INTERVAL_MS    50u
+#define DISPLAY_REFRESH_MS         120u   /* Limit OLED updates to reduce flicker */
 
 /* -------------------------------------------------------------------------- */
 /* Type declarations                                                          */
@@ -251,6 +268,7 @@ typedef struct {
     fix16_t target_duty;
     fix16_t current_duty;
     uint32_t rpm;
+    uint32_t rpm_smooth;
     uint32_t rpm_max;
     bool rpm_valid;
     uint32_t soft_timer_ms;
@@ -292,6 +310,7 @@ typedef struct {
     volatile uint16_t period_ticks;
     volatile uint8_t sample_ready;
     volatile uint8_t capture_valid;
+    volatile uint16_t good_period_ticks;
 } tach_state_t;
 
 typedef struct {
@@ -356,6 +375,7 @@ static fan_state_t g_fan = {
     .target_duty = 0,
     .current_duty = 0,
     .rpm = 0u,
+    .rpm_smooth = 0u,
     .rpm_max = 0u,
     .rpm_valid = false,
     .soft_timer_ms = 0,
@@ -399,6 +419,7 @@ static tach_state_t g_tach = {
     .period_ticks = 0,
     .sample_ready = 0,
     .capture_valid = 0,
+    .good_period_ticks = 0,
 };
 
 static log_state_t g_log = {
@@ -1157,13 +1178,23 @@ static void display_render(void)
     if (!g_display_initialized) {
         return;
     }
+    /* Throttle refresh to avoid visible flicker when numbers fluctuate. */
+    static uint32_t s_last_ms = 0u;
+    uint32_t now = g_uptime_ms;
+    if (s_last_ms != 0u) {
+        uint32_t dt = now - s_last_ms;
+        if (dt < DISPLAY_REFRESH_MS) {
+            return;
+        }
+    }
+    s_last_ms = now;
 
     char line[12];
     ssd1306_setbuf(0);
 
     uint16_t set_pct = percent_from_ratio(g_manual_target);
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
-    uint32_t rpm_now = g_fan.rpm;
+    uint32_t rpm_now = (g_fan.rpm_smooth != 0u) ? g_fan.rpm_smooth : g_fan.rpm;
 
     snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
@@ -1714,36 +1745,117 @@ static void tach_update(uint32_t delta_ms)
 {
     static uint32_t tach_timeout = 0;
     static uint32_t last_good_rpm = 0u;
+    /* Keep a small history of periods (ticks) for median filtering. */
+    enum { TACH_BUF_N = 5 };
+    static uint16_t period_buf[TACH_BUF_N];
+    static uint8_t  period_len = 0; /* 0..5 */
+
+    /* Candidate RPM that needs short confirmation when far from last_good_rpm */
+    static uint32_t candidate_rpm = 0u;
+    static uint8_t  candidate_score = 0u;
 
     tach_timeout += delta_ms;
 
     if (g_tach.sample_ready) {
         uint16_t period = g_tach.period_ticks;
         g_tach.sample_ready = 0;
-        if (period > 0u) {
+        if (period >= TACH_MIN_VALID_TICKS) {
+            /* Reset timeout on any plausible period to avoid false invalidation. */
+            tach_timeout = 0;
+            /* Push to history (keep newest at end). */
+            if (period_len < TACH_BUF_N) {
+                period_buf[period_len++] = period;
+            } else {
+                memmove(&period_buf[0], &period_buf[1], (TACH_BUF_N - 1) * sizeof(uint16_t));
+                period_buf[TACH_BUF_N - 1] = period;
+            }
+
+            /* Sort small buffer (n<=5). */
+            uint8_t n = period_len;
+            uint16_t tmp[TACH_BUF_N];
+            for (uint8_t i = 0; i < n; ++i) { tmp[i] = period_buf[i]; }
+            for (uint8_t i = 1; i < n; ++i) {
+                uint16_t key = tmp[i];
+                int8_t j = (int8_t)i - 1;
+                while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; --j; }
+                tmp[j + 1] = key;
+            }
+            /* Trimmed mean: drop min/max when n>=5; else use median/mean fallback. */
+            uint16_t period_est_ticks = 0;
+            if (n >= 5) {
+                uint32_t sum = 0;
+                for (uint8_t i = 1; i < n - 1; ++i) sum += tmp[i];
+                period_est_ticks = (uint16_t)(sum / (uint32_t)(n - 2));
+            } else if (n == 4) {
+                period_est_ticks = (uint16_t)((tmp[1] + tmp[2]) / 2u);
+            } else if (n == 3) {
+                period_est_ticks = tmp[1];
+            } else if (n == 2) {
+                period_est_ticks = (uint16_t)((tmp[0] + tmp[1]) / 2u);
+            } else {
+                period_est_ticks = tmp[0];
+            }
+
+            /* Convert to RPM using estimated period. */
             uint64_t numerator = (uint64_t)FAN_TACH_TIMER_CLOCK_HZ * 60u;
-            uint64_t denominator = (uint64_t)period * FAN_TACH_PULSES_PER_REV;
+            uint64_t denominator = (uint64_t)period_est_ticks * FAN_TACH_PULSES_PER_REV;
             uint32_t rpm = (denominator == 0u) ? 0u : (uint32_t)(numerator / denominator);
             if (rpm > FAN_TACH_MAX_RPM) {
                 rpm = FAN_TACH_MAX_RPM;
             }
-            tach_timeout = 0;
 
-            bool accept = true;
+            /* Static hard cap to kill extreme spikes */
             if (rpm > FAN_RPM_GLITCH_UPPER_RPM) {
-                accept = false;
-            }
+                /* Ignore outliers above trusted range */
+            } else {
+                bool accept = false;
+                if (last_good_rpm == 0u) {
+                    accept = (rpm > 0u);
+                } else {
+                    /* Reject sudden unrealistically low reading when commanded speed is above min. */
+                    if (last_good_rpm >= FAN_RPM_GLITCH_MIN_BASE &&
+                        rpm < FAN_RPM_GLITCH_MIN_BASE &&
+                        g_manual_target > g_fan_min_ratio) {
+                        accept = false;
+                    } else {
+                        /* Relative acceptance window */
+                        uint32_t up_lim   = (last_good_rpm * RPM_ACCEPT_UP_PCT) / 100u;
+                        uint32_t down_lim = (last_good_rpm * RPM_ACCEPT_DOWN_PCT) / 100u;
+                        if (rpm >= down_lim && rpm <= up_lim) {
+                            accept = true;
+                            candidate_score = 0u;
+                        } else {
+                            /* Require two consecutive near-equal candidates */
+                            uint32_t near_lo = (rpm * (100u - RPM_CANDIDATE_NEAR_PCT)) / 100u;
+                            uint32_t near_hi = (rpm * (100u + RPM_CANDIDATE_NEAR_PCT)) / 100u;
+                            if (candidate_score > 0u &&
+                                candidate_rpm >= near_lo && candidate_rpm <= near_hi) {
+                                candidate_score++;
+                            } else {
+                                candidate_rpm = rpm;
+                                candidate_score = 1u;
+                            }
+                            if (candidate_score >= 2u) {
+                                accept = true;
+                                candidate_score = 0u;
+                            }
+                        }
+                    }
+                }
 
-            if (accept && last_good_rpm >= FAN_RPM_GLITCH_MIN_BASE &&
-                rpm < FAN_RPM_GLITCH_MIN_BASE &&
-                g_manual_target > g_fan_min_ratio) {
-                accept = false;
-            }
-
-            if (accept) {
-                g_fan.rpm = rpm;
-                g_fan.rpm_valid = true;
-                last_good_rpm = rpm;
+                if (accept) {
+                    g_fan.rpm = rpm;
+                    g_fan.rpm_valid = true;
+                    last_good_rpm = rpm;
+                    g_tach.good_period_ticks = period_est_ticks;
+                    /* Smooth for display/logging without affecting peak detection. */
+                    if (g_fan.rpm_smooth == 0u) {
+                        g_fan.rpm_smooth = rpm;
+                    } else {
+                        int32_t diff = (int32_t)rpm - (int32_t)g_fan.rpm_smooth;
+                        g_fan.rpm_smooth = (uint32_t)((int32_t)g_fan.rpm_smooth + (diff >> RPM_LP_SHIFT));
+                    }
+                }
             }
         }
     }
@@ -1752,7 +1864,11 @@ static void tach_update(uint32_t delta_ms)
         tach_timeout = 0;
         g_fan.rpm_valid = false;
         g_fan.rpm = 0u;
+        g_fan.rpm_smooth = 0u;
         last_good_rpm = 0u;
+        period_len = 0u;
+        candidate_rpm = 0u;
+        candidate_score = 0u;
     }
 }
 
@@ -2087,7 +2203,16 @@ void EXTI7_0_IRQHandler(void)
     uint16_t capture = TIM2->CNT;
     if (g_tach.capture_valid) {
         uint16_t delta = (uint16_t)(capture - g_tach.last_capture);
-        if (delta > 0u) {
+        /* Ignore unrealistically short or too-early periods (contact bounce / EMI). */
+        uint16_t min_ticks = TACH_MIN_VALID_TICKS;
+        uint16_t good = g_tach.good_period_ticks;
+        if (good > 0u) {
+            uint32_t adaptive = ((uint32_t)good * TACH_EDGE_MIN_PCT) / 100u;
+            if (adaptive > min_ticks) {
+                min_ticks = (adaptive > 0xFFFFu) ? 0xFFFFu : (uint16_t)adaptive;
+            }
+        }
+        if (delta >= min_ticks) {
             g_tach.period_ticks = delta;
             g_tach.sample_ready = 1;
         }
