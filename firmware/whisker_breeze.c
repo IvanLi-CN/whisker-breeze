@@ -951,8 +951,10 @@ static uint16_t ina226_compute_calibration(void)
         return 0u;
     }
 
-    /* 0.00512 * 1e12 = 5_120_000_000 */
-    uint64_t cal = 5120000000ull / denom;
+    /* 0.00512 / (LSB_A * R_ohm)
+     * 采用 LSB 单位=nA、R 单位=µΩ，则分母量纲=1e-15，
+     * 因此需要乘以 1e15：0.00512 * 1e15 = 5_120_000_000_000。*/
+    uint64_t cal = 5120000000000ull / denom;
     if (cal > 0xFFFFu) {
         cal = 0xFFFFu;
     }
@@ -1142,7 +1144,6 @@ static void display_render(void)
     uint16_t set_pct = percent_from_ratio(g_manual_target);
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
     uint32_t rpm_now = g_fan.rpm;
-    uint32_t rpm_peak = g_fan.rpm_max;
 
     snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
@@ -1153,12 +1154,35 @@ static void display_render(void)
     snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
 
-    snprintf(line, sizeof line, "Pk %4lu", (unsigned long)rpm_peak);
+    /* 第四行：显示控制模式（不加标签）。AUTO/Manual/Calib */
+    if (g_mode == CONTROL_MODE_TEMP) {
+        snprintf(line, sizeof line, "Auto");
+    } else if (g_mode == CONTROL_MODE_MANUAL) {
+        snprintf(line, sizeof line, "Manual");
+    } else {
+        snprintf(line, sizeof line, "Calib");
+    }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
-    snprintf(line, sizeof line, "PD%s/12%s",
-             g_pd.present ? "OK" : "--",
-             g_pd.have_12v ? "OK" : "--");
+    /* 第五行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
+    if (g_ina.valid) {
+        int32_t mv = g_ina.bus_voltage_mv;
+        int32_t ma = g_ina.current_ma;
+        if (mv < 0) mv = 0; /* Clamp to 0 for display */
+        if (ma < 0) ma = 0;
+        long v_int = (long)(mv / 1000);
+        long v_dec1 = (long)((mv % 1000 + 50) / 100); /* round to 0.1V */
+        if (v_dec1 >= 10) { v_int += 1; v_dec1 -= 10; }
+        long ma_int = (long)ma; /* already rounded to 1 mA in INA driver */
+        if (ma_int < 0) ma_int = 0;
+        if (ma_int > 9999) ma_int = 9999; /* clamp to fit width */
+        /* e.g. "12.3V 450mA" -> fits within 12 chars */
+        snprintf(line, sizeof line, "%ld.%ldV %ldmA",
+                 v_int, v_dec1, ma_int);
+    } else {
+        /* 传感器无效时显示空值，不加任何标签 */
+        snprintf(line, sizeof line, "--.-V ----mA");
+    }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
 
     ssd1306_flush_window();
