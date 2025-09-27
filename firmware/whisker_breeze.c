@@ -171,9 +171,8 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #endif
 #define INA226_CURRENT_LSB_NA     ((uint32_t)(((uint64_t)INA226_MAX_EXPECTED_CURRENT_MA * 1000000ull) / 32768u))
 #define INA226_POWER_LSB_NW       (25u * INA226_CURRENT_LSB_NA)
-/* For the most stable readings we slow down polling; actual data update is
- * governed by AVG and conversion times below. */
-#define INA226_POLL_INTERVAL_MS   1000u
+/* Match ~1 Hz effective data cadence; new data period is ~1.064 s */
+#define INA226_POLL_INTERVAL_MS   1100u
 
 #define INA226_REG_CONFIG       0x00u
 #define INA226_REG_SHUNT        0x01u
@@ -182,17 +181,16 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define INA226_REG_CURRENT      0x04u
 #define INA226_REG_CALIBRATION  0x05u
 #define INA226_REG_MASK_ENABLE  0x06u
-/* Most-stable sampling config for INA226 (datasheet bits):
+/* 1 Hz-level, stable sampling for INA226 (datasheet bits):
  *  D15 RST=0
- *  D14..D12 reserved=0b100 (keep POR recommended value)
- *  D11..D9  AVG=0b111  → 1024 samples averaged
- *  D8..D6   VBUSCT=0b111 → 8.244 ms bus conversion
- *  D5..D3   VSHCT=0b111  → 8.244 ms shunt conversion
- *  D2..D0   MODE=0b111   → Shunt and Bus, continuous
- * This yields excellent noise rejection with an effective update period of
- * (8.244ms + 8.244ms) * 1024 ≈ 16.9 s per new averaged result.
+ *  D14..D12 = 0b010  (POR-required pattern per DS)
+ *  D11..D9  AVG=0b100 → 128 samples averaged
+ *  D8..D6   VBUSCT=0b110 → 4.156 ms bus conversion
+ *  D5..D3   VSHCT=0b110 → 4.156 ms shunt conversion
+ *  D2..D0   MODE=0b111 → Shunt+Bus continuous
+ * Effective new-data period ≈ (4.156ms + 4.156ms) * 128 ≈ 1.064 s.
  */
-#define INA226_CONFIG_CONTINUOUS 0x4FFFu
+#define INA226_CONFIG_CONTINUOUS 0x49B7u
 #define INA226_ERROR_LOG_INTERVAL_MS 1000u
 
 #define INA226_MAX_CONFIG_FAILURES     3u
