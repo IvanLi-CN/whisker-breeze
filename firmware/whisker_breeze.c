@@ -339,6 +339,16 @@ static controls_state_t g_controls = {
 
 static uint8_t g_controls_raw_mask = 0u;
 
+/* -------------------------------------------------------------------------- */
+/* Time base                                                                  */
+/* -------------------------------------------------------------------------- */
+/* Keep a precise millisecond uptime derived from SysTick instead of assuming
+ * a fixed loop period. This avoids drift when work in the loop varies or when
+ * Delay_Ms calibration differs across clock configs. */
+static uint32_t g_uptime_ms = 0;
+static uint32_t g_systick_last = 0;
+static uint32_t g_systick_rem_ticks = 0;
+
 static fix16_t g_manual_target = FIX16_ONE;
 
 static fan_state_t g_fan = {
@@ -447,7 +457,7 @@ static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
 static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
-static uint32_t g_uptime_ms = 0;
+/* g_uptime_ms moved above into the time base section */
 
 /* (diagnostic helpers removed to keep minimal behavior) */
 
@@ -2118,19 +2128,40 @@ int main(void)
 
     printf("Whisker Breeze controller ready\r\n");
 
+    /* Seed SysTick-based timekeeping. */
+    g_systick_last = SysTick->CNT;
+    g_systick_rem_ticks = 0;
+
     while (1) {
-        g_uptime_ms += LOOP_PERIOD_MS;
+        /* Measure elapsed real time using SysTick and convert to ms. */
+        uint32_t now = SysTick->CNT;
+        uint32_t dt_ticks = now - g_systick_last;
+        g_systick_last = now;
+
+        uint32_t accum_ticks = dt_ticks + g_systick_rem_ticks;
+        uint32_t delta_ms = accum_ticks / DELAY_MS_TIME;
+        g_systick_rem_ticks = accum_ticks % DELAY_MS_TIME;
+        if (delta_ms == 0u) {
+            /* Extremely rare here (loop contains a sleep). Ensure forward progress. */
+            delta_ms = 1u;
+        }
+
+        g_uptime_ms += delta_ms;
+
         power_update();
-        tach_update(LOOP_PERIOD_MS);
-        ch224_poll(LOOP_PERIOD_MS);
-        ina226_update(LOOP_PERIOD_MS);
-        temp_update(LOOP_PERIOD_MS);
-        fan_update(LOOP_PERIOD_MS);
+        tach_update(delta_ms);
+        ch224_poll(delta_ms);
+        ina226_update(delta_ms);
+        temp_update(delta_ms);
+        fan_update(delta_ms);
         poll_input();
         display_try_init();
         display_render();
-        led_update(LOOP_PERIOD_MS);
-        heartbeat_log(LOOP_PERIOD_MS);
+        led_update(delta_ms);
+        heartbeat_log(delta_ms);
+        
+        /* Target a nominal 10 ms cadence; the next iteration will account for
+         * the actual delay via SysTick-based delta above. */
         Delay_Ms(LOOP_PERIOD_MS);
     }
 }
