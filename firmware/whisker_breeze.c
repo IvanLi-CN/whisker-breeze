@@ -1167,15 +1167,15 @@ static bool i2c1_read_u8(uint8_t addr, uint8_t reg, uint8_t *value)
 /* -------------------------------------------------------------------------- */
 static void display_power(bool enable)
 {
-    /* Requirement: BAT must be held low (enable) at all times. */
+    /* BAT 低=使能，BAT 高=断电省电。 */
     if (enable) {
-        funDigitalWrite(PIN_DISPLAY_PWR, FUN_LOW);   /* BAT low: enable */
-        funDigitalWrite(PIN_DISPLAY_RESET, FUN_LOW); /* hold reset */
+        funDigitalWrite(PIN_DISPLAY_PWR, FUN_LOW);   /* 使能供电 */
+        funDigitalWrite(PIN_DISPLAY_RESET, FUN_LOW); /* 先保持复位 */
         Delay_Ms(5);
         funDigitalWrite(PIN_DISPLAY_RESET, FUN_HIGH);
     } else {
-        /* Keep BAT asserted low; do not disable power. */
-        funDigitalWrite(PIN_DISPLAY_PWR, FUN_LOW);
+        /* 断电 OLED 以降低功耗。 */
+        funDigitalWrite(PIN_DISPLAY_PWR, FUN_HIGH);
     }
 }
 
@@ -1186,13 +1186,17 @@ static void display_set_awake(bool awake)
         return;
     }
     g_display_awake = awake;
-    if (!g_display_initialized) {
-        return;
-    }
     if (awake) {
-        (void)ssd1306_cmd(SSD1306_DISPLAYON);
+        /* 将在 display_try_init() 中重新上电并初始化 */
+        g_display_probe_attempted = false;
+        g_display_initialized = false;
     } else {
-        (void)ssd1306_cmd(SSD1306_DISPLAYOFF);
+        /* 若当前仍上电，先逻辑关屏，再断电以省电 */
+        if (g_display_initialized) {
+            (void)ssd1306_cmd(SSD1306_DISPLAYOFF);
+        }
+        display_power(false); /* BAT 拉高省电 */
+        g_display_initialized = false;
     }
 }
 
@@ -1284,6 +1288,9 @@ static void display_render(void)
 
 static void display_try_init(void)
 {
+    if (!g_display_awake) {
+        return; /* 熄屏状态不尝试初始化（保持 BAT 高电平） */
+    }
     if (g_display_initialized) {
         return;
     }
