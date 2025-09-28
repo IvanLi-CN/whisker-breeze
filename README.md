@@ -62,6 +62,17 @@ Notes
 - Default target MCU is `CH32V003` (see `firmware/Makefile`).
 - Export `MINICHLINK` if using a custom minichlink binary location.
 
+### Display Orientation
+
+- The OLED can be shown in normal orientation (default) or rotated 180°.
+- Configure at build time via `DISPLAY_ORIENTATION_180`:
+
+  - Edit `firmware/funconfig.h` and set `#define DISPLAY_ORIENTATION_180 1`, or
+  - Recommended: pass `EXTRA_CFLAGS+=-DDISPLAY_ORIENTATION_180=1` to avoid overriding internal `CFLAGS`.
+    For example: `make flash EXTRA_CFLAGS+=-DDISPLAY_ORIENTATION_180=1` (at repo root), or append it in `firmware/Makefile`.
+
+Under the hood the firmware rotates the framebuffer in software at flush time (page+bit+column reversal), so drawing APIs stay the same.
+
 ## License
 
 The Whisker Breeze sources are provided under the MIT license. The `ch32fun`
