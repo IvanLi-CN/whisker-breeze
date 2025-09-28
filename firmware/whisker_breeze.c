@@ -45,6 +45,18 @@ static int ssd1306_quiet_printf(const char *fmt, ...)
 #undef printf
 #include "../ch32fun/extralibs/ssd1306.h"
 
+/* Orientation: do software 180° rotation at flush time for correctness. */
+
+#if DISPLAY_ORIENTATION_180
+static inline uint8_t bitrev8(uint8_t v)
+{
+    v = (uint8_t)(((v & 0x55u) << 1) | ((v >> 1) & 0x55u));
+    v = (uint8_t)(((v & 0x33u) << 2) | ((v >> 2) & 0x33u));
+    v = (uint8_t)((v << 4) | (v >> 4));
+    return v;
+}
+#endif
+
 static void ssd1306_flush_window(void)
 {
     /* 完全复刻“起始地址偏移版”风格：
@@ -54,12 +66,23 @@ static void ssd1306_flush_window(void)
      * - 垂直偏移 0x0C 由控制器内部完成，我们缓冲仍按 page=0..4 线性布局即可。
      */
     uint8_t line[100];
+
+    
     for (uint8_t p = 0; p < 5; ++p) {
         /* 组装一页100列数据，逻辑72列映射到 line[2..73]，左右补0 */
         memset(line, 0, sizeof line);
         for (uint16_t xi = 0; xi < SSD1306_W; ++xi) {
+#if DISPLAY_ORIENTATION_180
+            /* software 180°: reverse columns, reverse pages, reverse bits */
+            const uint16_t pages = (uint16_t)(SSD1306_H / 8u); /* 5 */
+            uint16_t x_src = (uint16_t)(SSD1306_W - 1u - xi);
+            uint16_t p_src = (uint16_t)(pages - 1u - p);
+            uint16_t addr  = x_src + (uint16_t)SSD1306_W * p_src;
+            uint8_t  v     = bitrev8(ssd1306_buffer[addr]);
+#else
             uint16_t addr = xi + (uint16_t)SSD1306_W * p; /* 直接取本页72字节 */
-            uint8_t v = ssd1306_buffer[addr];
+            uint8_t  v    = ssd1306_buffer[addr];
+#endif
             /* 放到列28起的窗口中：28 对应 line[0]，所以 30->line[2] */
             uint16_t out_idx = (uint16_t)xi + 2; /* 0..71 → 2..73 */
             if (out_idx < sizeof line) {
@@ -179,6 +202,11 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #ifndef INA226_I2C_ADDR
 #define INA226_I2C_ADDR           0x40u
 #endif
+
+#if (INA226_I2C_ADDR != 0x40u) && (INA226_I2C_ADDR != 0x44u)
+#error "INA226_I2C_ADDR must be 0x40 or 0x44"
+#endif
+
 #ifndef INA226_SHUNT_MICRO_OHMS
 #define INA226_SHUNT_MICRO_OHMS   10000u   /* 10 mΩ shunt */
 #endif
@@ -294,6 +322,7 @@ typedef struct {
     uint32_t sample_failures;
     uint32_t last_error_report_ms;
     uint8_t address;
+    uint8_t address_probe_mask;
     uint16_t raw_bus_reg;
 } ina226_state_t;
 
@@ -403,6 +432,7 @@ static ina226_state_t g_ina = {
     .sample_failures = 0,
     .last_error_report_ms = 0,
     .address = INA226_I2C_ADDR,
+    .address_probe_mask = 0u,
     .raw_bus_reg = 0,
 };
 
@@ -1028,7 +1058,27 @@ static void ina226_report_error(const char *stage)
     }
 }
 
-/* ina226_detect_address removed: fixed address is used */
+static uint8_t ina226_address_bit(uint8_t address)
+{
+    return (address == 0x44u) ? 0x02u : 0x01u;
+}
+
+static bool ina226_switch_to_alternate_address(void)
+{
+    uint8_t current_bit = ina226_address_bit(g_ina.address);
+    g_ina.address_probe_mask |= current_bit;
+
+    uint8_t alternate = (g_ina.address == 0x44u) ? 0x40u : 0x44u;
+    uint8_t alternate_bit = ina226_address_bit(alternate);
+
+    if ((g_ina.address_probe_mask & alternate_bit) != 0u) {
+        return false;
+    }
+
+    g_ina.address = alternate;
+    g_ina.last_error_report_ms = 0u;
+    return true;
+}
 
 static bool ina226_configure(void)
 {
@@ -1058,6 +1108,12 @@ static void ina226_update(uint32_t delta_ms)
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
+            if (ina226_switch_to_alternate_address()) {
+                g_ina.config_failures = 0u;
+                g_ina.sample_failures = 0u;
+                g_ina.poll_timer_ms = 0u;
+                return;
+            }
             if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES &&
                 g_uptime_ms >= INA226_PANIC_GRACE_MS) {
                 panic("INA226 configure failed");
@@ -1066,7 +1122,9 @@ static void ina226_update(uint32_t delta_ms)
         }
         g_ina.configured = true;
         g_ina.config_failures = 0u;
+        g_ina.sample_failures = 0u;
         g_ina.poll_timer_ms = 0u;
+        g_ina.address_probe_mask = ina226_address_bit(g_ina.address);
     }
 
     g_ina.poll_timer_ms += delta_ms;
@@ -1087,7 +1145,7 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.valid = false;
         g_ina.online_announced = false;
         g_ina.configured = false;
-        /* keep fixed address; do not reset */
+        /* keep last working address; fallback logic will probe alternate if needed */
         g_ina.config_failures = 0u;
         g_ina.bus_voltage_mv = 0;
         g_ina.shunt_voltage_uw = 0;
@@ -1337,9 +1395,9 @@ static void display_try_init(void)
     display_power(false);
     g_display_disabled_logged = true;
     if (g_display_error_seen) {
-        emit_log("[disp] SSD1306 timeout, disabled");
+        emit_log("[disp] timeout");
     } else {
-        emit_log("[disp] SSD1306 missing, disabled");
+        emit_log("[disp] missing");
     }
 }
 
@@ -1357,7 +1415,7 @@ static void ssd1306_init_72x40_custom(void)
     ssd1306_cmd(SSD1306_H - 1);                   // 0x27 (40 rows)
 
     ssd1306_cmd(SSD1306_SETDISPLAYOFFSET);        // 0xD3
-    ssd1306_cmd(SSD1306_VOFFSET);                 // 0x0C
+    ssd1306_cmd(SSD1306_VOFFSET);                 // vertical offset (fixed)
 
     ssd1306_cmd(SSD1306_SETSTARTLINE | 0x00);     // 0x40
     ssd1306_cmd(SSD1306_CHARGEPUMP);              // 0x8D
@@ -2310,7 +2368,7 @@ int main(void)
 
     (void)WaitForDebuggerToAttach(13);
 
-    emit_log("[boot] Whisker Breeze firmware starting (%s)", __DATE__ " " __TIME__);
+    emit_log("[boot] start %s", __TIME__);
     power_update();
     /* 上电先进入测速模式 */
     g_mode = CONTROL_MODE_CALIB;
