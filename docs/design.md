@@ -54,6 +54,17 @@ The Newvision N042-7240TSWEG01-H16 panel follows the SSD1306 reference design th
 
 Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISPLAY OFF`, initialise, clear RAM, enable VBAT (by asserting PA1 low), wait ≥100 ms for the charge pump to stabilise, and finally send `DISPLAY ON`. Firmware already controls PA1 and PD0; this table clarifies which physical nets correspond to the datasheet pins so that electrical and software documentation stay consistent.
 
+### EEPROM (M24C64-FMC6TG)
+
+- **Device**: ST M24C64-FMC6TG, 64-kbit I²C serial EEPROM with 4‑kB address space.
+- **I²C Address**: `0x50`. Device-address pins `E0`, `E1`, `E2` are tied to ground so the upper address bits are zero (`0b1010_000` per datasheet Table 3).
+- **Write Control**: `#WC` (pin 7) is hard-wired low, permitting byte and page writes without firmware‑driven gating.
+- **Power**: Pin 8 connected to `3V3`; `VSS` (pin 4) to ground. A 100 nF bypass capacitor (C18) is placed adjacent to the package between `VCC` and `GND`.
+- **Bus Topology**: Shares the main 3V3 I²C bus (`SDA` on PC1, `SCL` on PC2) with the SSD1306 display and INA226 current monitor; 4.7 kΩ pull-ups already present on the bus.
+- **Memory Organisation**: 8 kB array organised as 32-byte pages; sequential writes wrap within the current page. Firmware keeps the configuration record in the first page and ensures updates stay inside a single page boundary to avoid wraparound side-effects.
+- **Write Cycle**: Typical internal write time 5 ms (10 ms max). Firmware performs ACK polling after every STOP condition and clears `AF` error flags between attempts so the controller never stalls while the EEPROM finalises its write cycle.
+- **Purpose**: Persists user mode selections across power cycles—specifically whether the controller last ran in automatic (temperature) or manual mode and the manual fan speed target. Firmware writes a compact record after user changes and reapplies it once tach calibration completes at the next boot.
+
 ### Fan Drive and Tachometer
 
 - PWM output on PC3 (`TIM1_CH3`) should operate at 20–30 kHz to remain above audible range. Firmware applies a 0–100 ms linear ramp at power-on and then tracks the mode-derived target duty cycle.
