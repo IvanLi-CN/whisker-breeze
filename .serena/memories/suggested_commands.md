@@ -1,0 +1,12 @@
+# Suggested Commands
+- `git status -sb` — inspect repo status.
+- `git pull --rebase` — sync with remote before changes.
+- `make -C firmware clean` — remove build artefacts (`whisker_breeze.*`, generated linker script).
+- `EXTRA_CFLAGS='-DDISPLAY_ORIENTATION_180=1' make -C firmware whisker_breeze.elf` — build firmware with rotated display orientation (matches hardware expectation).
+- `make` (repo root) — proxy for `make -C firmware flash`; rebuild and flash via `minichlink`.
+- `make flash` — force rebuild + flash (same as `make -C firmware flash`).
+- `make clean` — clean from repo root.
+- `make attach` — open persistent `minichlink` debug session.
+- `clang-format -i firmware/whisker_breeze.c` — enforce style on touched C files.
+- `ls`, `rg`, `find` — Darwin shell staples for navigation and searches.
+- `git stash push <paths>` / `git stash pop` — manage local changes when syncing.
