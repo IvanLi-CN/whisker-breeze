@@ -202,6 +202,11 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #ifndef INA226_I2C_ADDR
 #define INA226_I2C_ADDR           0x40u
 #endif
+
+#if (INA226_I2C_ADDR != 0x40u) && (INA226_I2C_ADDR != 0x44u)
+#error "INA226_I2C_ADDR must be 0x40 or 0x44"
+#endif
+
 #ifndef INA226_SHUNT_MICRO_OHMS
 #define INA226_SHUNT_MICRO_OHMS   10000u   /* 10 mΩ shunt */
 #endif
@@ -317,6 +322,7 @@ typedef struct {
     uint32_t sample_failures;
     uint32_t last_error_report_ms;
     uint8_t address;
+    uint8_t address_probe_mask;
     uint16_t raw_bus_reg;
 } ina226_state_t;
 
@@ -426,6 +432,7 @@ static ina226_state_t g_ina = {
     .sample_failures = 0,
     .last_error_report_ms = 0,
     .address = INA226_I2C_ADDR,
+    .address_probe_mask = 0u,
     .raw_bus_reg = 0,
 };
 
@@ -1051,7 +1058,27 @@ static void ina226_report_error(const char *stage)
     }
 }
 
-/* ina226_detect_address removed: fixed address is used */
+static uint8_t ina226_address_bit(uint8_t address)
+{
+    return (address == 0x44u) ? 0x02u : 0x01u;
+}
+
+static bool ina226_switch_to_alternate_address(void)
+{
+    uint8_t current_bit = ina226_address_bit(g_ina.address);
+    g_ina.address_probe_mask |= current_bit;
+
+    uint8_t alternate = (g_ina.address == 0x44u) ? 0x40u : 0x44u;
+    uint8_t alternate_bit = ina226_address_bit(alternate);
+
+    if ((g_ina.address_probe_mask & alternate_bit) != 0u) {
+        return false;
+    }
+
+    g_ina.address = alternate;
+    g_ina.last_error_report_ms = 0u;
+    return true;
+}
 
 static bool ina226_configure(void)
 {
@@ -1081,6 +1108,12 @@ static void ina226_update(uint32_t delta_ms)
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
+            if (ina226_switch_to_alternate_address()) {
+                g_ina.config_failures = 0u;
+                g_ina.sample_failures = 0u;
+                g_ina.poll_timer_ms = 0u;
+                return;
+            }
             if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES &&
                 g_uptime_ms >= INA226_PANIC_GRACE_MS) {
                 panic("INA226 configure failed");
@@ -1089,7 +1122,9 @@ static void ina226_update(uint32_t delta_ms)
         }
         g_ina.configured = true;
         g_ina.config_failures = 0u;
+        g_ina.sample_failures = 0u;
         g_ina.poll_timer_ms = 0u;
+        g_ina.address_probe_mask = ina226_address_bit(g_ina.address);
     }
 
     g_ina.poll_timer_ms += delta_ms;
@@ -1110,7 +1145,7 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.valid = false;
         g_ina.online_announced = false;
         g_ina.configured = false;
-        /* keep fixed address; do not reset */
+        /* keep last working address; fallback logic will probe alternate if needed */
         g_ina.config_failures = 0u;
         g_ina.bus_voltage_mv = 0;
         g_ina.shunt_voltage_uw = 0;
