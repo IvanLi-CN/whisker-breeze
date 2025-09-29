@@ -62,6 +62,12 @@ Notes
 - Default target MCU is `CH32V003` (see `firmware/Makefile`).
 - Export `MINICHLINK` if using a custom minichlink binary location.
 
+### Power Behavior
+
+- The firmware no longer requires a fixed 12 V rail before proceeding with tach calibration and normal operation.
+- Instead, it waits until the supply voltage measured by INA226 is stable (consecutive samples within ~200 mV) and then starts calibration automatically.
+- USB‑PD negotiation still attempts to request 12 V when available, but operation is not gated on achieving 12 V.
+
 ### Display Orientation
 
 - The OLED can be shown in normal orientation (default) or rotated 180°.

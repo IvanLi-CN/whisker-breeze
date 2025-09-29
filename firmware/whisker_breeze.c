@@ -195,6 +195,12 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define RPM_CANDIDATE_NEAR_PCT     10u   /* candidate consolidation window */
 #define RPM_LP_SHIFT                2u    /* IIR: new = old + (x-old)/4 */
 #define INA226_12V_RAW_THRESHOLD      9200u   /* 11.5 V / 1.25 mV */
+/* Supply stability detection: consider VBUS "stable" when consecutive INA226
+ * bus-voltage samples differ by no more than this delta for a small count. */
+#define SUPPLY_STABLE_DELTA_MV        200     /* <=200 mV change considered stable */
+#define SUPPLY_STABLE_REQUIRED_SAMPLES 2      /* require N consecutive stable samples */
+/* Minimum voltage considered runnable once stable (works for 5V and above). */
+#define SUPPLY_MIN_RUN_MV             4000
 #define FAN_CALIBRATION_STABLE_MS     500u
 #define FAN_CALIBRATION_MIN_MS        2000u
 #define FAN_CALIBRATION_DELTA_RPM     25u
@@ -323,6 +329,10 @@ typedef struct {
     uint32_t last_error_report_ms;
     uint8_t address;
     uint16_t raw_bus_reg;
+    /* Supply stability tracking */
+    int32_t last_bus_mv_for_stable;
+    uint8_t stable_count;
+    bool voltage_stable;
 } ina226_state_t;
 
 typedef struct {
@@ -432,6 +442,9 @@ static ina226_state_t g_ina = {
     .last_error_report_ms = 0,
     .address = INA226_I2C_ADDR,
     .raw_bus_reg = 0,
+    .last_bus_mv_for_stable = 0,
+    .stable_count = 0,
+    .voltage_stable = false,
 };
 
 static pd_state_t g_pd = {
@@ -1101,6 +1114,9 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.current_ma = 0;
         g_ina.power_mw = 0;
         g_ina.raw_bus_reg = 0u;
+        g_ina.last_bus_mv_for_stable = 0;
+        g_ina.stable_count = 0;
+        g_ina.voltage_stable = false;
         if (g_ina.sample_failures < UINT32_MAX) {
             g_ina.sample_failures++;
         }
@@ -1125,6 +1141,29 @@ static void ina226_update(uint32_t delta_ms)
     g_ina.current_ma = current_ma;
     g_ina.power_mw = power_mw;
     g_ina.valid = true;
+
+    /* Update supply stability: require small delta across consecutive samples. */
+    {
+        bool prev_stable = g_ina.voltage_stable;
+        int32_t prev = g_ina.last_bus_mv_for_stable;
+        int32_t diff = bus_mv - prev;
+        if (diff < 0) diff = -diff;
+        if (prev != 0 && diff <= SUPPLY_STABLE_DELTA_MV) {
+            if (g_ina.stable_count < 0xFF) {
+                g_ina.stable_count++;
+            }
+        } else {
+            g_ina.stable_count = 0;
+            /* On first valid sample prev==0; don't mark unstable beyond reset. */
+        }
+        g_ina.last_bus_mv_for_stable = bus_mv;
+        if (g_ina.stable_count >= SUPPLY_STABLE_REQUIRED_SAMPLES) {
+            g_ina.voltage_stable = true;
+        }
+        if (!prev_stable && g_ina.voltage_stable) {
+            emit_log("[vbus]stable,%ldmV", (long)bus_mv);
+        }
+    }
     if (!g_ina.online_announced) {
         long bus_whole = bus_mv / 1000;
         long bus_frac = bus_mv % 1000;
@@ -2030,8 +2069,8 @@ static void fan_update(uint32_t delta_ms)
     }
 
     if (g_fan_calibration.active) {
-        /* 需要 12V；但即使当前 rpm 无效，只要曾经有效过也可完成 */
-        if (!g_pd.have_12v) {
+        /* 不再强制 12V；仅在电压稳定后开始测速 */
+        if (!(g_ina.valid && g_ina.voltage_stable)) {
             return;
         }
 
@@ -2101,16 +2140,27 @@ static void power_update(void)
     bool pg_raw = funDigitalRead(PIN_POWER_GOOD) == 0;
     bool ina_raw = funDigitalRead(PIN_INA_INT) == 0;
 
-    g_power.vbus_valid = POWER_GOOD_ACTIVE_LOW ? pg_raw : !pg_raw;
+    /* Treat VBUS as valid if either PG pin says so, or INA226 reports
+     * a stable supply above a safe minimum (e.g., >=4.0 V).
+     * This removes the hard dependency on external PG wiring/12V. */
+    bool pg_ok = POWER_GOOD_ACTIVE_LOW ? pg_raw : !pg_raw;
+    bool ina_ok = (g_ina.valid && g_ina.voltage_stable && g_ina.bus_voltage_mv >= SUPPLY_MIN_RUN_MV);
+    g_power.vbus_valid = pg_ok || ina_ok;
     g_power.ina_alert = INA_INT_ACTIVE_LOW ? ina_raw : !ina_raw;
 
     if (!g_power.vbus_valid) {
-        fan_apply_pwm(0, 0u);
-        g_fan.phase = FAN_PHASE_SOFT_START;
-        g_fan.soft_timer_ms = 0;
-        g_fan.rpm_max = 0u;
-        g_fan.rpm_valid = false;
-        fan_calibration_reset();
+        /* Only on falling edge do we reset fan state and stability tracking. */
+        if (prev_vbus) {
+            fan_apply_pwm(0, 0u);
+            g_fan.phase = FAN_PHASE_SOFT_START;
+            g_fan.soft_timer_ms = 0;
+            g_fan.rpm_max = 0u;
+            g_fan.rpm_valid = false;
+            fan_calibration_reset();
+            g_ina.last_bus_mv_for_stable = 0;
+            g_ina.stable_count = 0;
+            g_ina.voltage_stable = false;
+        }
     } else if (!prev_vbus && g_power.vbus_valid) {
         g_display_probe_attempted = false;
     }
@@ -2163,7 +2213,8 @@ static void ch224_poll(uint32_t delta_ms)
         g_pd.pd_active = false;
         g_pd.have_12v = measured_12v;
         LOG_PD_IF_CHANGED("read_fail");
-        if (!g_pd.have_12v) {
+        /* Only reset calibration if supply info is invalid/unstable, not based on 12V. */
+        if (!(g_ina.valid && g_ina.voltage_stable)) {
             fan_calibration_reset();
         }
         return;
@@ -2177,7 +2228,8 @@ static void ch224_poll(uint32_t delta_ms)
         g_pd.pd_active = false;
         g_pd.have_12v = measured_12v;
         LOG_PD_IF_CHANGED("status");
-        if (!g_pd.have_12v) {
+        /* Only reset calibration if supply info is invalid/unstable, not based on 12V. */
+        if (!(g_ina.valid && g_ina.voltage_stable)) {
             fan_calibration_reset();
         }
         return;
