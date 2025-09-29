@@ -322,7 +322,6 @@ typedef struct {
     uint32_t sample_failures;
     uint32_t last_error_report_ms;
     uint8_t address;
-    uint8_t address_probe_mask;
     uint16_t raw_bus_reg;
 } ina226_state_t;
 
@@ -432,7 +431,6 @@ static ina226_state_t g_ina = {
     .sample_failures = 0,
     .last_error_report_ms = 0,
     .address = INA226_I2C_ADDR,
-    .address_probe_mask = 0u,
     .raw_bus_reg = 0,
 };
 
@@ -671,7 +669,7 @@ static void panic(const char *fmt, ...)
     }
 
     if (message[0] != '\0') {
-        emit_log("[panic] %s", message);
+        emit_log("[panic]%s", message);
     } else {
         emit_log("[panic]");
     }
@@ -684,7 +682,7 @@ static void panic(const char *fmt, ...)
 
 static void log_pd_snapshot(const char *reason)
 {
-    emit_log("[pd]%s v=%d 12=%d",
+    emit_log("[pd]%s,%d,%d",
              reason,
              g_power.vbus_valid ? 1 : 0,
              g_pd.have_12v ? 1 : 0);
@@ -697,22 +695,7 @@ static void log_fan_snapshot(void)
     uint16_t rpm_now = rpm_to_u16(g_fan.rpm);
     uint16_t temp_c = (g_temp.temp_c_x100 >= 0) ? (uint16_t)g_temp.temp_c_x100 : 0u;
     uint16_t bus_raw = g_ina.valid ? g_ina.raw_bus_reg : 0u;
-    int32_t current_ma = g_ina.current_ma;
-    uint16_t compare_ticks = TIM1->CH3CVR;
-    uint8_t btn_raw_mask = g_controls_raw_mask;
-    uint8_t btn_stable_mask = 0u;
-
-    if (g_controls.decrease_input.stable_state) {
-        btn_stable_mask |= 0x1u;
-    }
-    if (g_controls.hold_input.stable_state) {
-        btn_stable_mask |= 0x2u;
-    }
-    if (g_controls.increase_input.stable_state) {
-        btn_stable_mask |= 0x4u;
-    }
-
-    emit_log("[fan] p=%d t=%u d=%u r=%u tmp=%u adc=%u/%u v=%d 12=%d b=%04X i=%ld c=%u k=%u/%u",
+    emit_log("[fan]%d,%u,%u,%u,%u,%u,%u,%d,%d,%04X",
              g_fan.phase,
              (unsigned)target_pct,
              (unsigned)duty_pct,
@@ -722,11 +705,7 @@ static void log_fan_snapshot(void)
              (unsigned)g_temp.adc_avg,
              g_power.vbus_valid ? 1 : 0,
              g_pd.have_12v ? 1 : 0,
-             (unsigned)bus_raw,
-             (long)current_ma,
-             (unsigned)compare_ticks,
-             (unsigned)btn_raw_mask,
-             (unsigned)btn_stable_mask);
+             (unsigned)bus_raw);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1053,31 +1032,9 @@ static void ina226_report_error(const char *stage)
     uint32_t now = g_uptime_ms;
     if (g_ina.last_error_report_ms == 0u ||
         (now - g_ina.last_error_report_ms) >= INA226_ERROR_LOG_INTERVAL_MS) {
-        emit_log("[ina]%s fail 0x%02X", stage, (unsigned)g_ina.address);
+        emit_log("[ina]%s,%02X", stage, (unsigned)g_ina.address);
         g_ina.last_error_report_ms = (now == 0u) ? 1u : now;
     }
-}
-
-static uint8_t ina226_address_bit(uint8_t address)
-{
-    return (address == 0x44u) ? 0x02u : 0x01u;
-}
-
-static bool ina226_switch_to_alternate_address(void)
-{
-    uint8_t current_bit = ina226_address_bit(g_ina.address);
-    g_ina.address_probe_mask |= current_bit;
-
-    uint8_t alternate = (g_ina.address == 0x44u) ? 0x40u : 0x44u;
-    uint8_t alternate_bit = ina226_address_bit(alternate);
-
-    if ((g_ina.address_probe_mask & alternate_bit) != 0u) {
-        return false;
-    }
-
-    g_ina.address = alternate;
-    g_ina.last_error_report_ms = 0u;
-    return true;
 }
 
 static bool ina226_configure(void)
@@ -1108,12 +1065,6 @@ static void ina226_update(uint32_t delta_ms)
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
-            if (ina226_switch_to_alternate_address()) {
-                g_ina.config_failures = 0u;
-                g_ina.sample_failures = 0u;
-                g_ina.poll_timer_ms = 0u;
-                return;
-            }
             if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES &&
                 g_uptime_ms >= INA226_PANIC_GRACE_MS) {
                 panic("INA226 configure failed");
@@ -1124,7 +1075,6 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.config_failures = 0u;
         g_ina.sample_failures = 0u;
         g_ina.poll_timer_ms = 0u;
-        g_ina.address_probe_mask = ina226_address_bit(g_ina.address);
     }
 
     g_ina.poll_timer_ms += delta_ms;
@@ -1145,7 +1095,6 @@ static void ina226_update(uint32_t delta_ms)
         g_ina.valid = false;
         g_ina.online_announced = false;
         g_ina.configured = false;
-        /* keep last working address; fallback logic will probe alternate if needed */
         g_ina.config_failures = 0u;
         g_ina.bus_voltage_mv = 0;
         g_ina.shunt_voltage_uw = 0;
