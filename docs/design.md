@@ -62,6 +62,8 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 - **Power**: Pin 8 connected to `3V3`; `VSS` (pin 4) to ground. A 100 nF bypass capacitor (C18) is placed adjacent to the package between `VCC` and `GND`.
 - **Bus Topology**: Shares the main 3V3 I²C bus (`SDA` on PC1, `SCL` on PC2) with the SSD1306 display and INA226 current monitor; 4.7 kΩ pull-ups already present on the bus.
 - **Memory Organisation**: 8 kB array organised as 32-byte pages; sequential writes wrap within the current page. Firmware keeps the configuration record in the first page and ensures updates stay inside a single page boundary to avoid wraparound side-effects.
+- **Font Store**: Bytes `0x0200–0x09FF` (2 kB) persist the 8×8 ASCII glyph table previously linked into flash. The production firmware streams glyph rows from this region at render time instead of carrying the table in program memory.
+- **Provisioning**: A dedicated `eeprom_font_writer` firmware image performs a full erase/program/verify pass of the 2 kB font payload. Run it after EEPROM replacement or when updating the font table.
 - **Write Cycle**: Typical internal write time 5 ms (10 ms max). Firmware performs ACK polling after every STOP condition and clears `AF` error flags between attempts so the controller never stalls while the EEPROM finalises its write cycle.
 - **Purpose**: Persists user mode selections across power cycles—specifically whether the controller last ran in automatic (temperature) or manual mode and the manual fan speed target. Firmware writes a compact record after user changes and reapplies it once tach calibration completes at the next boot.
 

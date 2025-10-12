@@ -48,12 +48,14 @@ Prerequisites
 Build & Flash (from repository root)
 
 ```sh
-make        # rebuilds firmware and flashes (proxy to firmware/)
+make flash           # rebuilds and flashes the main controller firmware
+make flash-font      # flash EEPROM font writer, programs glyphs, then reflash main
 ```
 
 Useful targets
 
 - `make flash` - forces rebuild then programs the board via minichlink.
+- `make flash-font` - flashes the `eeprom_font_writer` utility; it writes and verifies the 2 kB font blob at EEPROM offsets `0x0200–0x09FF` before idling. Reflash the main firmware afterwards.
 - `make clean` - removes build artefacts in `firmware/`.
 - `make attach` - opens a persistent minichlink debug session.
 
@@ -61,6 +63,7 @@ Notes
 
 - Default target MCU is `CH32V003` (see `firmware/Makefile`).
 - Export `MINICHLINK` if using a custom minichlink binary location.
+- The 8×8 monospace font previously linked into flash now lives inside the external EEPROM (2 kB region starting at `0x0200`). Ensure the writer firmware has been run at least once after assembling or replacing the EEPROM.
 
 ### Power Behavior
 

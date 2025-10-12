@@ -5,6 +5,9 @@
 #include <string.h>
 #include <stdarg.h>
 
+#include "i2c_lowlevel.h"
+#include "eeprom_font_storage.h"
+
 typedef int32_t fix16_t;
 
 #define FIX16_FRAC_BITS 16
@@ -18,6 +21,7 @@ typedef int32_t fix16_t;
 #define SSD1306_OFFSET 30
 /* 严格对齐“起始地址偏移版”参考：纵向偏移 0x0C，列起点偏移列=28（低0x0C/高0x11） */
 #define SSD1306_VOFFSET 12
+#define SSD1306_USE_EXTERNAL_FONT 1u /* app-side only; submodule未依赖此宏 */
 
 /*
  * 逻辑坐标从 (0,0) 开始，实际写入时通过列偏移=30、行偏移=14 映射到玻璃。
@@ -44,6 +48,44 @@ static int ssd1306_quiet_printf(const char *fmt, ...)
 #include "../ch32fun/extralibs/ssd1306_i2c.h"
 #undef printf
 #include "../ch32fun/extralibs/ssd1306.h"
+
+/*
+ * 应用侧自定义字库渲染：不修改子模块，改为在本文件内提供
+ * ssd1306_drawstr 的等价实现，并通过宏将调用重定向到这里。
+ * 依赖 eeprom_font_storage.ssd1306_font_fetch() 从外置 EEPROM 取 8x8 字形。
+ */
+static inline void wb_drawchar_ext(uint8_t x, uint8_t y, uint8_t chr, uint8_t color)
+{
+    uint8_t rows[8];
+    ssd1306_font_fetch(chr, rows);
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint8_t row = rows[i];
+        for (uint32_t j = 0; j < 8; ++j) {
+            /* 字形按bit7为最高位 -> 左到右 */
+            uint8_t bit = (uint8_t)(0x80u >> j);
+            if (row & bit) {
+                ssd1306_drawPixel((uint32_t)x + j, (uint32_t)y + i, color);
+            } else {
+                /* 背景保持不变：不清像素，避免闪烁；行级别先清屏 */
+            }
+        }
+    }
+}
+
+static inline void wb_drawstr_ext(uint8_t x, uint8_t y, char *str, uint8_t color)
+{
+    if (!str) return;
+    uint8_t cx = x;
+    for (const char *p = str; *p; ++p) {
+        /* 简单ASCII宽度8像素，超出宽度直接裁剪 */
+        if ((uint32_t)cx >= SSD1306_W) break;
+        wb_drawchar_ext(cx, y, (uint8_t)*p, color);
+        cx = (uint8_t)(cx + 8);
+    }
+}
+
+/* 将本文件后续对 ssd1306_drawstr 的调用全部重定向到应用侧实现 */
+#define ssd1306_drawstr wb_drawstr_ext
 
 /* Orientation: do software 180° rotation at flush time for correctness. */
 
@@ -696,297 +738,6 @@ static void log_fan_snapshot(void)
              (unsigned)bus_raw);
 }
 
-/* -------------------------------------------------------------------------- */
-/* Debounce helpers                                                           */
-/* -------------------------------------------------------------------------- */
-static bool debounce_update(debounce_t *db, bool raw_level)
-{
-    if (raw_level == db->stable_state) {
-        db->counter = 0;
-        return false;
-    }
-
-    if (db->counter < MODE_DEBOUNCE_TICKS) {
-        db->counter++;
-        if (db->counter >= MODE_DEBOUNCE_TICKS) {
-            db->stable_state = raw_level;
-            db->counter = 0;
-            return true;
-        }
-    }
-    return false;
-}
-
-/* -------------------------------------------------------------------------- */
-/* I2C helpers (blocking)                                                     */
-/* -------------------------------------------------------------------------- */
-static void i2c1_configure_speed(uint32_t target_hz)
-{
-    if (target_hz == 0u) {
-        return;
-    }
-
-    uint32_t pclk_hz = FUNCONF_SYSTEM_CORE_CLOCK;
-    if (pclk_hz == 0u) {
-        pclk_hz = 48000000u;
-    }
-
-    uint32_t freq_mhz = pclk_hz / 1000000u;
-    if (freq_mhz < 2u) {
-        freq_mhz = 2u;
-    }
-    if (freq_mhz > 32u) {
-        freq_mhz = 32u;
-    }
-
-    I2C1->CTLR1 &= ~I2C_CTLR1_PE;
-
-    I2C1->CTLR2 &= ~I2C_CTLR2_FREQ;
-    I2C1->CTLR2 |= (uint16_t)(freq_mhz & I2C_CTLR2_FREQ);
-
-    uint32_t fast_cutoff_hz = 100000u;
-    uint32_t ckcfgr = 0u;
-
-    if (target_hz <= fast_cutoff_hz) {
-        uint32_t denom = target_hz * 2u;
-        uint32_t ccr = (pclk_hz + denom - 1u) / denom;
-        if (ccr < 4u) {
-            ccr = 4u;
-        }
-        if (ccr > 0x0FFFu) {
-            ccr = 0x0FFFu;
-        }
-        ckcfgr = ccr & 0x0FFFu;
-    } else {
-        uint32_t denom = target_hz * 3u;
-        uint32_t ccr = (pclk_hz + denom - 1u) / denom;
-        if (ccr < 1u) {
-            ccr = 1u;
-        }
-        if (ccr > 0x0FFFu) {
-            ccr = 0x0FFFu;
-        }
-        ckcfgr = I2C_CKCFGR_FS | (ccr & 0x0FFFu);
-    }
-
-    I2C1->CKCFGR = (uint16_t)ckcfgr;
-
-    I2C1->CTLR1 |= I2C_CTLR1_PE;
-    I2C1->CTLR1 |= I2C_CTLR1_ACK;
-}
-
-static bool i2c1_wait_flag(uint32_t mask)
-{
-    int32_t timeout = 100000;
-    while (timeout-- > 0) {
-        uint32_t status = I2C1->STAR1 | ((uint32_t)I2C1->STAR2 << 16);
-        if ((status & mask) == mask) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool i2c1_wait_not_busy(void)
-{
-    int32_t timeout = 100000;
-    while (timeout-- > 0) {
-        if ((I2C1->STAR2 & I2C_STAR2_BUSY) == 0u) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* i2c1_scan_bus removed: address discovery not required */
-
-static bool i2c1_read_current_u8(uint8_t addr, uint8_t *value)
-{
-    if (!value) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_ACK;
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)(((uint16_t)addr << 1) | 1u);
-
-    if (!i2c1_wait_flag(0x00030002u)) {
-        return false;
-    }
-
-    I2C1->CTLR1 &= ~I2C_CTLR1_ACK;
-    I2C1->CTLR1 |= I2C_CTLR1_STOP;
-
-    int32_t timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_RXNE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    *value = (uint8_t)I2C1->DATAR;
-    I2C1->CTLR1 |= I2C_CTLR1_ACK;
-    return true;
-}
-
-static bool i2c1_write_u8(uint8_t addr, uint8_t reg, uint8_t data)
-{
-    if (!i2c1_wait_not_busy()) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)((uint16_t)addr << 1);
-    if (!i2c1_wait_flag(0x00070082u)) {
-        return false;
-    }
-
-    int32_t timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = reg;
-
-    timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = data;
-
-    if (!i2c1_wait_flag(0x00070084u)) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_STOP;
-    return true;
-}
-
-static bool i2c1_write_u16(uint8_t addr, uint8_t reg, uint16_t value)
-{
-    if (!i2c1_wait_not_busy()) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)((uint16_t)addr << 1);
-    if (!i2c1_wait_flag(0x00070082u)) {
-        return false;
-    }
-
-    int32_t timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = reg;
-
-    timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint8_t)(value >> 8);
-
-    timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint8_t)(value & 0xFFu);
-
-    if (!i2c1_wait_flag(0x00070084u)) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_STOP;
-    return true;
-}
-
-static bool i2c1_read_u16(uint8_t addr, uint8_t reg, uint16_t *value)
-{
-    if (!value) {
-        return false;
-    }
-
-    if (!i2c1_wait_not_busy()) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)((uint16_t)addr << 1);
-    if (!i2c1_wait_flag(0x00070082u)) {
-        return false;
-    }
-
-    int32_t timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = reg;
-    if (!i2c1_wait_flag(0x00070084u)) {
-        return false;
-    }
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)(((uint16_t)addr << 1) | 1u);
-    if (!i2c1_wait_flag(0x00030002u)) {
-        return false;
-    }
-
-    int32_t btf_timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_BTF) == 0u) && btf_timeout-- > 0) {
-    }
-    if (btf_timeout <= 0) {
-        return false;
-    }
-
-    I2C1->CTLR1 &= ~I2C_CTLR1_ACK;
-    I2C1->CTLR1 |= I2C_CTLR1_STOP;
-
-    uint8_t msb = (uint8_t)I2C1->DATAR;
-    uint8_t lsb = (uint8_t)I2C1->DATAR;
-
-    I2C1->CTLR1 |= I2C_CTLR1_ACK;
-
-    *value = ((uint16_t)msb << 8) | (uint16_t)lsb;
-    return true;
-}
 
 static uint16_t ina226_compute_calibration(void)
 {
@@ -1165,39 +916,26 @@ static void ina226_update(uint32_t delta_ms)
     }
 }
 
-static bool i2c1_read_u8(uint8_t addr, uint8_t reg, uint8_t *value)
+
+/* -------------------------------------------------------------------------- */
+/* Debounce helpers                                                           */
+/* -------------------------------------------------------------------------- */
+static bool debounce_update(debounce_t *db, bool raw_level)
 {
-    if (!value) {
+    if (raw_level == db->stable_state) {
+        db->counter = 0;
         return false;
     }
 
-    if (!i2c1_wait_not_busy()) {
-        return false;
+    if (db->counter < MODE_DEBOUNCE_TICKS) {
+        db->counter++;
+        if (db->counter >= MODE_DEBOUNCE_TICKS) {
+            db->stable_state = raw_level;
+            db->counter = 0;
+            return true;
+        }
     }
-
-    I2C1->CTLR1 |= I2C_CTLR1_START;
-    if (!i2c1_wait_flag(0x00030001u)) {
-        return false;
-    }
-
-    I2C1->DATAR = (uint16_t)((uint16_t)addr << 1);
-    if (!i2c1_wait_flag(0x00070082u)) {
-        return false;
-    }
-
-    int32_t timeout = 100000;
-    while (((I2C1->STAR1 & I2C_STAR1_TXE) == 0u) && timeout-- > 0) {
-    }
-    if (timeout <= 0) {
-        return false;
-    }
-
-    I2C1->DATAR = reg;
-    if (!i2c1_wait_flag(0x00070084u)) {
-        return false;
-    }
-
-    return i2c1_read_current_u8(addr, value);
+    return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2397,6 +2135,20 @@ int main(void)
     temp_init();
     ssd1306_i2c_setup();
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
+
+    bool font_ready = eeprom_wait_ready(50u);
+    if (font_ready) {
+        uint8_t probe_rows[8];
+        if (!font_storage_fetch_rows('0', probe_rows)) {
+            emit_log("[ee] font missing");
+            font_ready = false;
+        }
+    } else {
+        emit_log("[ee] no ack");
+    }
+    if (!font_ready) {
+        g_display_error_seen = true;
+    }
 
     (void)WaitForDebuggerToAttach(13);
 
