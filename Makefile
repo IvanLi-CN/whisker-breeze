@@ -1,9 +1,13 @@
-.PHONY: all flash clean attach
+.PHONY: all flash flash-font clean attach
 
-all: flash
+all:
+	$(MAKE) -C firmware all
 
 flash:
 	$(MAKE) -C firmware flash
+
+flash-font:
+	$(MAKE) -C firmware flash-eeprom_font_writer
 
 clean:
 	$(MAKE) -C firmware clean
