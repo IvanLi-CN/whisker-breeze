@@ -290,7 +290,8 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define INA226_MAX_SAMPLE_FAILURES     3u
 #define INA226_PANIC_GRACE_MS          200u
 
-#define I2C1_SHARED_BUS_TARGET_HZ 400000u
+/* Keep initial I2C conservative to maximize compatibility; can raise later. */
+#define I2C1_SHARED_BUS_TARGET_HZ 100000u
 
 #define LOG_SAMPLE_PERIOD_MS      1000u
 #define LOG_FORCE_INTERVAL_MS     5000u
@@ -557,6 +558,11 @@ static bool           g_restore_pending = false;
 static uint32_t g_cfg_last_save_ms = 0u;
 static fix16_t  g_cfg_last_saved_manual = 0; /* initialized on first save */
 
+/* Forward decls for helpers used before their full definitions */
+static void emit_log(const char *fmt, ...);
+/* Temperature-band offset used by AUTO mapping; full definition appears below. */
+static int16_t g_temp_band_offset_cx100;
+
 static inline uint16_t ratio_to_q8_8(fix16_t r)
 {
     if (r <= 0) return 0u;
@@ -577,7 +583,7 @@ static void persist_save_now(const char *tag)
     cfg.version = 1u;
     cfg.last_mode = (g_mode == CONTROL_MODE_MANUAL) ? CFG_MODE_MANUAL : CFG_MODE_TEMP;
     cfg.manual_ratio_q8_8 = ratio_to_q8_8(g_manual_target);
-    cfg.temp_band_offset_cx100 = 0; /* added in future commit: auto band shift */
+    cfg.temp_band_offset_cx100 = g_temp_band_offset_cx100;
     if (eeprom_cfg_save(&cfg)) {
         g_cfg_last_save_ms = g_uptime_ms;
         g_cfg_last_saved_manual = g_manual_target;
@@ -592,6 +598,73 @@ static void persist_save_throttled(const char *tag, uint32_t min_interval_ms)
         persist_save_now(tag);
     }
 }
+
+/* -------------------------------------------------------------------------- */
+/* I2C diagnostics (optional)                                                 */
+/* -------------------------------------------------------------------------- */
+#if I2C_DIAG_ENABLE
+static void i2c_diag_log_levels(const char *stage)
+{
+    int sda = funDigitalRead(PIN_I2C_SDA);
+    int scl = funDigitalRead(PIN_I2C_SCL);
+    int busy = (I2C1->STAR2 & I2C_STAR2_BUSY) ? 1 : 0;
+    emit_log("[i2c]%s,sda=%d,scl=%d,busy=%d", stage, sda, scl, busy);
+}
+
+static bool i2c_probe_addr(uint8_t addr7)
+{
+    if (!i2c1_wait_not_busy()) {
+        return false;
+    }
+    I2C1->CTLR1 |= I2C_CTLR1_START;
+    if (!i2c1_wait_flag(0x00030001u)) {
+        return false;
+    }
+    I2C1->DATAR = (uint16_t)((uint16_t)addr7 << 1);
+    bool ok = i2c1_wait_flag(0x00070082u);
+    /* Issue STOP regardless */
+    I2C1->CTLR1 |= I2C_CTLR1_STOP;
+    return ok;
+}
+#endif
+
+/* Optional stuck-bus recovery (SDA held low at boot) */
+#if I2C_RECOVER_ENABLE
+static void i2c_bus_recover(void)
+{
+    /* Disable I2C peripheral to get direct GPIO control */
+    I2C1->CTLR1 &= ~I2C_CTLR1_PE;
+
+    /* Configure pins: SCL as OD output, SDA as input with pull-up */
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_OD);
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_IN_PUPD);
+    funDigitalWrite(PIN_I2C_SDA, FUN_HIGH);
+
+    /* Pulse SCL until SDA releases (max 12 clocks). */
+    for (int i = 0; i < 12; ++i) {
+        if (funDigitalRead(PIN_I2C_SDA)) break;
+        funDigitalWrite(PIN_I2C_SCL, FUN_LOW);
+        Delay_Ms(1);
+        funDigitalWrite(PIN_I2C_SCL, FUN_HIGH);
+        Delay_Ms(1);
+    }
+
+    /* STOP: SDA low -> SCL high -> SDA high */
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_OD);
+    funDigitalWrite(PIN_I2C_SDA, FUN_LOW);
+    Delay_Ms(1);
+    funDigitalWrite(PIN_I2C_SCL, FUN_HIGH);
+    Delay_Ms(1);
+    funDigitalWrite(PIN_I2C_SDA, FUN_HIGH);
+
+    /* Restore AF-OD and re-enable I2C */
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    I2C1->CTLR1 |= I2C_CTLR1_PE;
+    I2C1->CTLR1 |= I2C_CTLR1_ACK;
+    i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
+}
+#endif
 
 static void fan_calibration_reset(void)
 {
@@ -713,8 +786,13 @@ static void reset_fan_log_timer(void)
 /* -------------------------------------------------------------------------- */
 /* Logging helpers                                                            */
 /* -------------------------------------------------------------------------- */
+#ifndef WB_LOG_ENABLE
+#define WB_LOG_ENABLE 0
+#endif
+
 static void emit_log(const char *fmt, ...)
 {
+#if WB_LOG_ENABLE
     char buffer[160];
     va_list args;
     va_start(args, fmt);
@@ -740,7 +818,6 @@ static void emit_log(const char *fmt, ...)
                   (unsigned long)millis,
                   buffer);
 
-    /* Minimal fix: if no debugger, skip logging to avoid blocking. */
     if (!DidDebuggerAttach()) {
         return;
     }
@@ -752,6 +829,10 @@ static void emit_log(const char *fmt, ...)
     while (!DebugPrintfBufferFree()) {
         poll_input();
     }
+#else
+    (void)fmt;
+    /* Logs compiled out for size. */
+#endif
 }
 
 /* panic() removed to save flash; all INA paths now fail-soft with LED fault. */
@@ -1420,6 +1501,12 @@ static void board_init(void)
 {
     funGpioInitAll();
 
+    /* Ensure I2C1 clock and pins are configured up-front so any early
+     * EEPROM/INA access has valid AF-OD on PC1/PC2. */
+    RCC->APB1PCENR |= RCC_APB1Periph_I2C1;
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+
     funPinMode(PIN_DISPLAY_PWR, GPIO_CFGLR_OUT_10Mhz_PP);
     funPinMode(PIN_DISPLAY_RESET, GPIO_CFGLR_OUT_10Mhz_PP);
     funDigitalWrite(PIN_DISPLAY_PWR, FUN_HIGH);
@@ -1659,16 +1746,41 @@ static int16_t ntc_temp_c_x100_from_adc(uint16_t code)
 }
 
 /* Map temperature (centi-°C) to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
+/* Adjustable AUTO band: default [20,40]°C with a fixed 20°C width, shifted by offset. */
+#define TEMP_BAND_BASE_LOW_CX100     2000
+#define TEMP_BAND_WIDTH_CX100        2000
+#define TEMP_BAND_MIN_CX100          0
+#define TEMP_BAND_MAX_CX100          10000
+#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s */
+
+static int16_t g_temp_band_offset_cx100 = 0;     /* Δ relative to [20,40]°C */
+static int32_t g_temp_band_accum_cx100 = 0;      /* accumulator for fractional steps */
+
+static inline int16_t temp_band_low(void)
+{
+    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + g_temp_band_offset_cx100);
+}
+static inline int16_t temp_band_high(void)
+{
+    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100 + g_temp_band_offset_cx100);
+}
+
 static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
 {
-    if (temp_c_x100 <= 2000) {
+    int16_t lo = temp_band_low();
+    int16_t hi = temp_band_high();
+    if (temp_c_x100 <= lo) {
         return 0;
     }
-    if (temp_c_x100 >= 4000) {
+    if (temp_c_x100 >= hi) {
         return FIX16_ONE;
     }
-    int32_t pos = (int32_t)temp_c_x100 - 2000; /* 0..2000 */
-    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(2000));
+    int32_t span = (int32_t)hi - (int32_t)lo; /* 2000 */
+    if (span <= 0) {
+        return FIX16_ONE;
+    }
+    int32_t pos = (int32_t)temp_c_x100 - (int32_t)lo; /* 0..span */
+    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(span));
     fix16_t range = FIX16_ONE - g_fan_min_ratio;
     return g_fan_min_ratio + fix16_mul(frac, range);
 }
@@ -1824,6 +1936,29 @@ static void fan_update(uint32_t delta_ms)
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
+        /* Allow band shift while in AUTO using SLOW/FAST */
+        int dir = 0;
+        if (g_controls.decrease_input.stable_state) dir += 1;  /* SLOW → hotter */
+        if (g_controls.increase_input.stable_state) dir -= 1;  /* FAST → colder */
+        if (dir != 0) {
+            int32_t delta = (int32_t)delta_ms * (int32_t)TEMP_BAND_ADJ_RATE_CX100_S * dir;
+            g_temp_band_accum_cx100 += delta;
+            while (g_temp_band_accum_cx100 >= 1000) {
+                g_temp_band_offset_cx100 += 1; /* +1 centi-°C */
+                g_temp_band_accum_cx100 -= 1000;
+            }
+            while (g_temp_band_accum_cx100 <= -1000) {
+                g_temp_band_offset_cx100 -= 1;
+                g_temp_band_accum_cx100 += 1000;
+            }
+            /* Clamp to keep band within [0,100]°C */
+            int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;         /* -2000 */
+            int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100); /* +6000 */
+            if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
+            if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
+            /* Persist occasionally */
+            persist_save_throttled("band", 1000u);
+        }
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
@@ -1950,8 +2085,7 @@ static void fan_update(uint32_t delta_ms)
             /* Apply restored mode/target if requested */
             if (g_restore_pending) {
                 if (g_restore_mode == CONTROL_MODE_MANUAL) {
-                    g_manual_target = fix16_clamp(q8_8_to_ratio(ratio_to_q8_8(g_restore_manual_target)),
-                                                  g_fan_min_ratio, FIX16_ONE);
+                    g_manual_target = fix16_clamp(g_restore_manual_target, g_fan_min_ratio, FIX16_ONE);
                     g_mode = CONTROL_MODE_MANUAL;
                     emit_log("[mode]manual");
                 }
@@ -2196,8 +2330,26 @@ int main(void)
     pwm_init();
     tach_init();
     temp_init();
-    ssd1306_i2c_setup();
+    /* Ensure I2C pins (PC1/PC2) are configured to AF-OD before any EEPROM/INA access. */
+    (void)ssd1306_i2c_init();
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
+    Delay_Ms(5);
+#if I2C_DIAG_ENABLE
+    i2c_diag_log_levels("boot");
+#endif
+#if I2C_RECOVER_ENABLE
+    if (!funDigitalRead(PIN_I2C_SDA)) {
+        i2c_bus_recover();
+    }
+#endif
+    /* Quick address probe only when diagnostics are enabled. */
+#if I2C_DIAG_ENABLE
+    emit_log("[i2c]probe,50=%d,3C=%d,40=%d,44=%d",
+             i2c_probe_addr(0x50) ? 1 : 0,
+             i2c_probe_addr(0x3C) ? 1 : 0,
+             i2c_probe_addr(0x40) ? 1 : 0,
+             i2c_probe_addr(0x44) ? 1 : 0);
+#endif
 
     bool font_ready = eeprom_wait_ready(50u);
     if (font_ready) {
@@ -2214,6 +2366,13 @@ int main(void)
     if (eeprom_cfg_load(&cfg)) {
         g_restore_mode = (cfg.last_mode == CFG_MODE_MANUAL) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
         g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
+        /* Clamp loaded band offset to allowed range */
+        int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;
+        int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100);
+        int32_t off = cfg.temp_band_offset_cx100;
+        if (off < min_off) off = min_off;
+        if (off > max_off) off = max_off;
+        g_temp_band_offset_cx100 = (int16_t)off;
         g_restore_pending = true;
         emit_log("[cfg]ok");
     } else {
@@ -2232,7 +2391,7 @@ int main(void)
     fan_calibration_reset();
     emit_log("[mode]init calib");
     ch224_poll(CH224_POLL_INTERVAL_MS);
-    ina226_update(INA226_POLL_INTERVAL_MS);
+    /* Defer INA first contact to the main loop after I2C/display bring-up */
     log_pd_snapshot("boot");
     log_fan_snapshot();
     g_log.have_last = true;
@@ -2263,11 +2422,12 @@ int main(void)
         power_update();
         tach_update(delta_ms);
         ch224_poll(delta_ms);
+        /* Initialize display/I2C early in the loop so the bus is configured for other devices. */
+        display_try_init();
         ina226_update(delta_ms);
         temp_update(delta_ms);
         fan_update(delta_ms);
         poll_input();
-        display_try_init();
         display_idle_update(delta_ms);
         display_render();
         led_update(delta_ms);
@@ -2278,3 +2438,7 @@ int main(void)
         Delay_Ms(LOOP_PERIOD_MS);
     }
 }
+/* Build-time diagnostics toggle (0 reduces flash). */
+#ifndef I2C_DIAG_ENABLE
+#define I2C_DIAG_ENABLE 0
+#endif
