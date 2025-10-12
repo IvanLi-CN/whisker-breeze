@@ -166,3 +166,37 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 
 - Firmware entry: `firmware/whisker_breeze.c`
 - Hardware notes repository: `docs/`
+
+## EEPROM Layout & Control State Persistence
+
+- Device: 64‑kbit I²C EEPROM at `0x50` (4 kB address space, 32‑byte page size).
+- Reserved font area: `0x0200–0x09FF` (2 kB) used by `eeprom_font_storage`.
+- Application config area: allocate the first 64 bytes at `0x0000–0x003F` for controller state.
+
+Config block (little‑endian, packed):
+- `uint16_t magic` = 0x5742 ('W''B')
+- `uint8_t  version` = 0x01
+- `uint8_t  flags` = 0x00 (reserved)
+- `uint8_t  last_mode` = 1: TEMP(auto), 2: MANUAL
+- `uint16_t manual_ratio_q8_8` = manual target as Q8.8 (0..256). 1.00 → 256.
+- `int16_t  temp_band_offset_cx100` = offset of the auto‑control temperature band in centi‑°C relative to the default [20 °C, 40 °C] window. Positive shifts the whole band hotter; negative shifts colder. Default 0.
+- `uint16_t checksum16` = unsigned 16‑bit sum of all preceding bytes in the block.
+
+Notes:
+- Writes are page‑aligned by the driver and throttled in firmware (≥1 s between saves) to protect endurance.
+- On power‑up, firmware loads the block if `magic`, `version`, and `checksum16` validate. If invalid, defaults apply.
+- Restore policy: firmware always boots into CALIB for tach profiling; once calibration completes, it switches to AUTO. If the persisted `last_mode` is MANUAL, firmware then switches to MANUAL and applies `manual_ratio_q8_8`.
+
+## Auto‑Mode Temperature Band Shift
+
+- Default mapping: temperature 20 °C→min ratio, 40 °C→1.00 ratio; linear in‑between, ≤20 °C clamps to 0, ≥40 °C clamps to 1.00.
+- Adjustable band: keep the 20 °C span fixed and shift the entire band up/down with SLOW/FAST in AUTO mode.
+  - Let `BASE_LOW = 20 °C`, `BASE_HIGH = 40 °C`, `WIDTH = 20 °C`.
+  - Runtime offset `Δ` (centi‑°C). Effective low/high = `[BASE_LOW+Δ, BASE_HIGH+Δ]`.
+  - Bounds: clamp `Δ` so the band stays within `[0 °C, 100 °C]` → `Δ ∈ [-20 °C, +60 °C]`.
+  - Adjustment rate while pressed: 0.5 °C/s (50 centi‑°C per second), continuous while holding the key.
+  - Direction per UI: SLOW moves the band hotter (up), FAST moves it colder (down) — this changes the resulting speed at the current temperature without leaving AUTO mode.
+
+Rationale:
+- Persisting `last_mode` and the last manual target allows predictable startup behavior.
+- Shifting the control band preserves tuning feel while adapting to different ambient baselines.
