@@ -333,6 +333,7 @@ typedef struct {
     int32_t last_bus_mv_for_stable;
     uint8_t stable_count;
     bool voltage_stable;
+    bool fault;
 } ina226_state_t;
 
 typedef struct {
@@ -445,6 +446,7 @@ static ina226_state_t g_ina = {
     .last_bus_mv_for_stable = 0,
     .stable_count = 0,
     .voltage_stable = false,
+    .fault = false,
 };
 
 static pd_state_t g_pd = {
@@ -664,34 +666,7 @@ static void emit_log(const char *fmt, ...)
     }
 }
 
-static void panic(const char *fmt, ...)
-{
-    char message[160];
-    va_list args;
-    va_start(args, fmt);
-    int written = mini_vsnprintf(message, sizeof message, fmt, args);
-    va_end(args);
-
-    if (written < 0) {
-        message[0] = '\0';
-    } else if (written >= (int)sizeof message) {
-        written = (int)sizeof message - 1;
-        message[written] = '\0';
-    } else {
-        message[written] = '\0';
-    }
-
-    if (message[0] != '\0') {
-        emit_log("[panic]%s", message);
-    } else {
-        emit_log("[panic]");
-    }
-
-    __disable_irq();
-    for (;;) {
-        __NOP();
-    }
-}
+/* panic() removed to save flash; all INA paths now fail-soft with LED fault. */
 
 static void log_pd_snapshot(const char *reason)
 {
@@ -1067,9 +1042,13 @@ static bool ina226_configure(void)
     return true;
 }
 
+/* Forward declaration for LED fault override. */
+static void led_set_fault_mode(bool on);
+
 static void ina226_update(uint32_t delta_ms)
 {
     if (!g_ina.configured) {
+        /* Configure at current address; on failure, try the alternate strap (0x40/0x44 only). */
         if (!ina226_configure()) {
             g_ina.valid = false;
             g_ina.online_announced = false;
@@ -1078,16 +1057,31 @@ static void ina226_update(uint32_t delta_ms)
             }
             g_ina.raw_bus_reg = 0u;
             ina226_report_error("configure");
-            if (g_ina.config_failures >= INA226_MAX_CONFIG_FAILURES &&
-                g_uptime_ms >= INA226_PANIC_GRACE_MS) {
-                panic("INA226 configure failed");
+            /* Attempt the other strap address exactly once. */
+            if (g_ina.address == 0x40u) {
+                emit_log("[ina]try,44");
+                g_ina.address = 0x44u;
+                if (!ina226_configure()) {
+                    g_ina.fault = true;
+                    led_set_fault_mode(true);
+                    return;
+                }
+            } else {
+                emit_log("[ina]try,40");
+                g_ina.address = 0x40u;
+                if (!ina226_configure()) {
+                    g_ina.fault = true;
+                    led_set_fault_mode(true);
+                    return;
+                }
             }
-            return;
         }
         g_ina.configured = true;
         g_ina.config_failures = 0u;
         g_ina.sample_failures = 0u;
         g_ina.poll_timer_ms = 0u;
+        g_ina.fault = false;
+        led_set_fault_mode(false);
     }
 
     g_ina.poll_timer_ms += delta_ms;
@@ -1121,10 +1115,8 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.sample_failures++;
         }
         ina226_report_error("sample");
-        if (g_ina.sample_failures >= INA226_MAX_SAMPLE_FAILURES &&
-            g_uptime_ms >= INA226_PANIC_GRACE_MS) {
-            panic("INA226 read failed");
-        }
+        /* On repeated failures, the next pass will reconfigure and run address fallback.
+           Engage fault LED if both addresses later fail in configure stage. */
         return;
     }
 
@@ -1161,7 +1153,7 @@ static void ina226_update(uint32_t delta_ms)
             g_ina.voltage_stable = true;
         }
         if (!prev_stable && g_ina.voltage_stable) {
-            emit_log("[vbus]stable,%ldmV", (long)bus_mv);
+        emit_log("[vbus]stable,%ldmV", (long)bus_mv);
         }
     }
     if (!g_ina.online_announced) {
@@ -1359,6 +1351,8 @@ static void display_try_init(void)
 
     g_display_error_seen = false;
     if (ssd1306_i2c_init() == 0) {
+        /* Ensure shared bus timing is applied before any transaction. */
+        i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
         const uint8_t probe_cmd = 0xAE; /* Display OFF */
         int probe_result = ssd1306_pkt_send(&probe_cmd, 1, 1);
         if (!g_display_error_seen && probe_result == 0) {
@@ -1368,6 +1362,8 @@ static void display_try_init(void)
             g_display_initialized = true;
             g_display_disabled_logged = false;
             emit_log("[disp]ok");
+            /* IMPORTANT: ssd1306_i2c_init() forces I2C1 to ~1MHz. Restore shared bus speed. */
+            i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 
             /* 初始化成功，按当前逻辑状态决定是否点亮。*/
             if (!g_display_awake) {
@@ -1387,6 +1383,8 @@ static void display_try_init(void)
     } else {
         emit_log("[disp] missing");
     }
+    /* Restore (or enforce) I2C speed even on failure. */
+    i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1514,6 +1512,24 @@ static struct {
 static inline void led_on(void)  { funDigitalWrite(PIN_STATUS_LED, FUN_LOW); }
 static inline void led_off(void) { funDigitalWrite(PIN_STATUS_LED, FUN_HIGH); }
 
+/* Fault override: when true, LED blinks at 0.5 Hz (1s ON, 1s OFF). */
+static bool g_led_fault_mode = false;
+static uint32_t g_led_fault_ms = 0u;
+static bool g_led_fault_on = false;
+
+static void led_set_fault_mode(bool on)
+{
+    if (g_led_fault_mode == on) {
+        return;
+    }
+    g_led_fault_mode = on;
+    g_led_fault_ms = 0u;
+    g_led_fault_on = false;
+    if (!on) {
+        led_off();
+    }
+}
+
 static inline uint8_t clamp_u8(uint8_t v, uint8_t lo, uint8_t hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -1527,6 +1543,21 @@ static inline uint8_t led_pct_from_duty(void)
 
 static void led_update(uint32_t delta_ms)
 {
+    if (g_led_fault_mode) {
+        /* 0.5 Hz blink: toggle every 1000 ms. */
+        g_led_fault_ms += delta_ms;
+        if (g_led_fault_ms >= 1000u) {
+            g_led_fault_ms -= 1000u;
+            g_led_fault_on = !g_led_fault_on;
+            if (g_led_fault_on) {
+                led_on();
+            } else {
+                led_off();
+            }
+        }
+        return;
+    }
+
     /* Determine readiness: VBUS valid and calibration completed with at least one RPM sample. */
     bool system_ready = g_power.vbus_valid && g_fan_calibration.completed && g_fan.rpm_valid;
 
