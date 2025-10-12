@@ -30,7 +30,7 @@ else
 
 TARGET_MCU?=CH32V003
 TARGET_EXT?=c
-ADDITIONAL_C_FILES:=i2c_lowlevel.c eeprom_font_storage.c
+ADDITIONAL_C_FILES:=i2c_lowlevel.c eeprom_font_storage.c eeprom_config.c
 
 include ../ch32fun/ch32fun/ch32fun.mk
 

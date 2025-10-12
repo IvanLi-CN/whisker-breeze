@@ -7,6 +7,7 @@
 
 #include "i2c_lowlevel.h"
 #include "eeprom_font_storage.h"
+#include "eeprom_config.h"
 
 typedef int32_t fix16_t;
 
@@ -546,6 +547,51 @@ typedef enum {
 
 /* 默认先测速，完成后进入温控；MODE 只在 TEMP/MANUAL 间切换 */
 static control_mode_t g_mode = CONTROL_MODE_CALIB;
+
+/* Persisted state restore (applied after calibration) */
+static control_mode_t g_restore_mode = CONTROL_MODE_TEMP;
+static fix16_t        g_restore_manual_target = FIX16_ONE;
+static bool           g_restore_pending = false;
+
+/* Config persistence throttle */
+static uint32_t g_cfg_last_save_ms = 0u;
+static fix16_t  g_cfg_last_saved_manual = 0; /* initialized on first save */
+
+static inline uint16_t ratio_to_q8_8(fix16_t r)
+{
+    if (r <= 0) return 0u;
+    if (r >= FIX16_ONE) return 256u;
+    return (uint16_t)(((int64_t)r * 256 + (FIX16_ONE / 2)) >> FIX16_FRAC_BITS);
+}
+
+static inline fix16_t q8_8_to_ratio(uint16_t q)
+{
+    if (q >= 256u) return FIX16_ONE;
+    return (fix16_t)(((int64_t)q << FIX16_FRAC_BITS) / 256);
+}
+
+static void persist_save_now(const char *tag)
+{
+    (void)tag;
+    eeprom_runtime_cfg_t cfg;
+    cfg.version = 1u;
+    cfg.last_mode = (g_mode == CONTROL_MODE_MANUAL) ? CFG_MODE_MANUAL : CFG_MODE_TEMP;
+    cfg.manual_ratio_q8_8 = ratio_to_q8_8(g_manual_target);
+    cfg.temp_band_offset_cx100 = 0; /* added in future commit: auto band shift */
+    if (eeprom_cfg_save(&cfg)) {
+        g_cfg_last_save_ms = g_uptime_ms;
+        g_cfg_last_saved_manual = g_manual_target;
+        emit_log("[cfg]save");
+    }
+}
+
+static void persist_save_throttled(const char *tag, uint32_t min_interval_ms)
+{
+    uint32_t now = g_uptime_ms;
+    if ((now - g_cfg_last_save_ms) >= min_interval_ms) {
+        persist_save_now(tag);
+    }
+}
 
 static void fan_calibration_reset(void)
 {
@@ -1506,6 +1552,8 @@ static void controls_update(void)
         if (g_mode != CONTROL_MODE_CALIB) {
             g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
             emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
+            /* Persist mode change & latest manual target */
+            persist_save_throttled("mode", 1000u);
         }
     }
 
@@ -1791,6 +1839,11 @@ static void fan_update(uint32_t delta_ms)
         if (g_manual_target < g_fan_min_ratio) {
             g_manual_target = g_fan_min_ratio;
         }
+        /* Persist manual target occasionally when it changes notably */
+        fix16_t diff = fix16_abs(g_manual_target - g_cfg_last_saved_manual);
+        if (diff > (FIX16_ONE / 50)) { /* >2% change */
+            persist_save_throttled("manual", 2000u);
+        }
     }
 
     fix16_t ratio = g_manual_target;
@@ -1894,6 +1947,16 @@ static void fan_update(uint32_t delta_ms)
             /* 测速完成后切入温控 */
             g_mode = CONTROL_MODE_TEMP;
             emit_log("[mode]auto");
+            /* Apply restored mode/target if requested */
+            if (g_restore_pending) {
+                if (g_restore_mode == CONTROL_MODE_MANUAL) {
+                    g_manual_target = fix16_clamp(q8_8_to_ratio(ratio_to_q8_8(g_restore_manual_target)),
+                                                  g_fan_min_ratio, FIX16_ONE);
+                    g_mode = CONTROL_MODE_MANUAL;
+                    emit_log("[mode]manual");
+                }
+                g_restore_pending = false;
+            }
         }
     }
 
@@ -2145,6 +2208,16 @@ int main(void)
         }
     } else {
         emit_log("[ee] no ack");
+    }
+    /* Try load persisted control state even if font rows are missing. */
+    eeprom_runtime_cfg_t cfg;
+    if (eeprom_cfg_load(&cfg)) {
+        g_restore_mode = (cfg.last_mode == CFG_MODE_MANUAL) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+        g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
+        g_restore_pending = true;
+        emit_log("[cfg]ok");
+    } else {
+        emit_log("[cfg]none");
     }
     if (!font_ready) {
         g_display_error_seen = true;
