@@ -632,6 +632,7 @@ static void emit_log(const char *fmt, ...);
 extern uint32_t g_display_sleep_timeout_ms;
 /* Temperature-band offset used by AUTO mapping; full definition appears below. */
 static int16_t g_temp_band_offset_cx100;
+static int32_t g_temp_band_accum_cx100; /* legacy accumulator; defined later */
 static int16_t g_auto_min_cx100 = 2000; /* 默认 20°C */
 static int16_t g_auto_max_cx100 = 4000; /* 默认 40°C */
 
@@ -682,7 +683,10 @@ static void persist_save_now(const char *tag)
     if (eeprom_cfg_save(&cfg)) {
         g_cfg_last_save_ms = g_uptime_ms;
         g_cfg_last_saved_manual = g_manual_target;
+        
+#if WB_LOG_ENABLE
         emit_log("[cfg]save");
+#endif
     }
 }
 
@@ -973,7 +977,10 @@ static void ina226_report_error(const char *stage)
     uint32_t now = g_uptime_ms;
     if (g_ina.last_error_report_ms == 0u ||
         (now - g_ina.last_error_report_ms) >= INA226_ERROR_LOG_INTERVAL_MS) {
+        
+#if WB_LOG_ENABLE
         emit_log("[ina]%s,%02X", stage, (unsigned)g_ina.address);
+#endif
         g_ina.last_error_report_ms = (now == 0u) ? 1u : now;
     }
 }
@@ -1012,7 +1019,10 @@ static void ina226_update(uint32_t delta_ms)
             ina226_report_error("configure");
             /* Attempt the other strap address exactly once. */
             if (g_ina.address == 0x40u) {
+                
+#if WB_LOG_ENABLE
                 emit_log("[ina]try,44");
+#endif
                 g_ina.address = 0x44u;
                 if (!ina226_configure()) {
                     g_ina.fault = true;
@@ -1020,7 +1030,10 @@ static void ina226_update(uint32_t delta_ms)
                     return;
                 }
             } else {
+                
+#if WB_LOG_ENABLE
                 emit_log("[ina]try,40");
+#endif
                 g_ina.address = 0x40u;
                 if (!ina226_configure()) {
                     g_ina.fault = true;
@@ -1112,7 +1125,10 @@ static void ina226_update(uint32_t delta_ms)
     if (!g_ina.online_announced) {
         long bus_whole = bus_mv / 1000;
         long bus_frac = bus_mv % 1000;
+        
+#if WB_LOG_ENABLE
         emit_log("[ina]%ld.%03ldV", bus_whole, bus_frac);
+#endif
         g_ina.online_announced = true;
         g_ina.last_error_report_ms = 0u;
     }
@@ -1297,14 +1313,18 @@ static void display_try_init(void)
 
     if (g_display_unavailable) {
         if (!g_display_disabled_logged) {
+#if WB_LOG_ENABLE
             emit_log("[disp] skip (disabled)");
+#endif
             g_display_disabled_logged = true;
         }
         return;
     }
 
     if (!g_display_probe_attempted) {
+#if WB_LOG_ENABLE
         emit_log("[disp] probe");
+#endif
     }
 
     g_display_probe_attempted = true;
@@ -1323,7 +1343,9 @@ static void display_try_init(void)
             ssd1306_setbuf(0);
             g_display_initialized = true;
             g_display_disabled_logged = false;
+#if WB_LOG_ENABLE
             emit_log("[disp]ok");
+#endif
             /* IMPORTANT: ssd1306_i2c_init() forces I2C1 to ~1MHz. Restore shared bus speed. */
             i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 
@@ -1341,9 +1363,13 @@ static void display_try_init(void)
     display_power(false);
     g_display_disabled_logged = true;
     if (g_display_error_seen) {
+#if WB_LOG_ENABLE
         emit_log("[disp] timeout");
+#endif
     } else {
+#if WB_LOG_ENABLE
         emit_log("[disp] missing");
+#endif
     }
     /* Restore (or enforce) I2C speed even on failure. */
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
@@ -1795,6 +1821,29 @@ static void ui_update(uint32_t delta_ms)
 
     if (long_evt) {
         if (g_settings_mode == SETTINGS_INACTIVE) {
+            /* Fold current AUTO offset into absolute min/max so Settings shows the
+             * effective band. Then reset runtime offset to zero. */
+            if (g_temp_band_offset_cx100 != 0) {
+                int32_t new_min = (int32_t)g_auto_min_cx100 + (int32_t)g_temp_band_offset_cx100;
+                int32_t new_max = (int32_t)g_auto_max_cx100 + (int32_t)g_temp_band_offset_cx100;
+                /* Clamp to absolute bounds */
+                if (new_min < TEMP_ABS_MIN_CX100) new_min = TEMP_ABS_MIN_CX100;
+                if (new_min > TEMP_ABS_MAX_CX100) new_min = TEMP_ABS_MAX_CX100;
+                if (new_max < TEMP_ABS_MIN_CX100) new_max = TEMP_ABS_MIN_CX100;
+                if (new_max > TEMP_ABS_MAX_CX100) new_max = TEMP_ABS_MAX_CX100;
+                /* Ensure ordering and at least 1°C span */
+                if (new_max <= new_min) new_max = new_min + 100;
+                if (new_max > TEMP_ABS_MAX_CX100) {
+                    new_max = TEMP_ABS_MAX_CX100;
+                    if (new_min >= new_max) new_min = new_max - 100;
+                }
+                g_auto_min_cx100 = (int16_t)new_min;
+                g_auto_max_cx100 = (int16_t)new_max;
+                /* Reset legacy/runtime offset and its accumulator */
+                g_temp_band_offset_cx100 = 0;
+                g_temp_band_accum_cx100 = 0;
+                /* No immediate save required; leaving Settings will persist. */
+            }
             g_settings_mode = SETTINGS_SELECT;
             g_settings_index = 0;
             g_display_idle_ms = 0u;
@@ -2611,14 +2660,18 @@ int main(void)
 #endif
 
     bool font_ready = eeprom_wait_ready(50u);
-    if (font_ready) {
+        if (font_ready) {
         uint8_t probe_rows[8];
         if (!font_storage_fetch_rows('0', probe_rows)) {
+#if WB_LOG_ENABLE
             emit_log("[ee] font missing");
+#endif
             font_ready = false;
         }
     } else {
+#if WB_LOG_ENABLE
         emit_log("[ee] no ack");
+#endif
     }
     /* Try load persisted control state even if font rows are missing. */
     eeprom_runtime_cfg_t cfg;
@@ -2651,9 +2704,14 @@ int main(void)
         if (sleep_s > 60u) sleep_s = 60u;
         g_display_sleep_timeout_ms = sleep_s * 1000u;
         g_restore_pending = true;
+#if WB_LOG_ENABLE
         emit_log("[cfg]ok");
+#endif
     } else {
+        
+#if WB_LOG_ENABLE
         emit_log("[cfg]none");
+#endif
     }
     if (!font_ready) {
         g_display_error_seen = true;
@@ -2661,7 +2719,10 @@ int main(void)
 
     /* Optional: attach debugger wait removed for size. */
 
+    
+#if WB_LOG_ENABLE
     emit_log("[boot] start %s", __TIME__);
+#endif
     power_update();
     /* 上电先进入测速模式 */
     g_mode = CONTROL_MODE_CALIB;
@@ -2674,7 +2735,7 @@ int main(void)
     g_log.have_last = true;
     reset_fan_log_timer();
 
-    printf("Whisker Breeze controller ready\r\n");
+    /* startup banner removed to save flash */
 
     /* Seed SysTick-based timekeeping. */
     g_systick_last = SysTick->CNT;
