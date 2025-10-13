@@ -1746,7 +1746,6 @@ static void ui_update(uint32_t delta_ms)
     static bool     mode_long_fired = false; /* fire long event immediately upon threshold */
     static bool     prev_dec = false;
     static bool     prev_inc = false;
-    static uint8_t  last_raw_mask_ui = 0u;
     static uint32_t dec_rep_ms = 0u;
     static uint32_t inc_rep_ms = 0u;
 
@@ -1814,23 +1813,18 @@ static void ui_update(uint32_t delta_ms)
         }
     }
 
-    /* Rising edges for SLOW/FAST */
+    /* Rising edges for SLOW/FAST (debounced only; no multi-step on hold) */
     bool dec_rise = (!prev_dec) && dec_now;
     bool inc_rise = (!prev_inc) && inc_now;
-    /* Also consider raw (non-debounced) rising edges to capture short taps */
-    uint8_t raw_now = g_controls_raw_mask;
-    bool dec_raw_rise = ((last_raw_mask_ui & 0x1u) == 0) && ((raw_now & 0x1u) != 0);
-    bool inc_raw_rise = ((last_raw_mask_ui & 0x4u) == 0) && ((raw_now & 0x4u) != 0);
     prev_dec = dec_now;
     prev_inc = inc_now;
-    last_raw_mask_ui = raw_now;
 
     /* Selection movement */
     if (g_settings_mode == SETTINGS_SELECT) {
-        if (dec_rise || dec_raw_rise) {
+        if (dec_rise) {
             g_settings_index = (uint8_t)((g_settings_index + 3 - 1) % 3);
         }
-        if (inc_rise || inc_raw_rise) {
+        if (inc_rise) {
             g_settings_index = (uint8_t)((g_settings_index + 1) % 3);
         }
     }
