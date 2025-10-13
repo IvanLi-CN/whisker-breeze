@@ -620,6 +620,10 @@ typedef enum {
 static settings_mode_t g_settings_mode = SETTINGS_INACTIVE;
 static uint8_t         g_settings_index = 0; /* 0=min,1=max,2=sleep */
 
+/* One-tap click counters (debounced edges), only used when not in settings */
+static uint8_t g_click_dec = 0; /* SLOW taps */
+static uint8_t g_click_inc = 0; /* FAST taps */
+
 __attribute__((noinline)) static void clamp_offset_to_band(void)
 {
     int32_t min_off = (int32_t)TEMP_ABS_MIN_CX100 - (int32_t)g_auto_min_cx100;
@@ -1727,6 +1731,12 @@ static void controls_update(void)
         g_display_idle_ms = 0u;
     }
 
+    /* 累积单击事件（仅在非设置界面），供手动模式做离散步进 */
+    if (g_settings_mode == SETTINGS_INACTIVE) {
+        if (dec_rise && g_click_dec < 250) g_click_dec++;
+        if (inc_rise && g_click_inc < 250) g_click_inc++;
+    }
+
     /* MODE 的短按/长按在 ui_update() 中统一处理，这里不再直接切换模式。 */
 
     s_last_dec = dec_now;
@@ -2177,17 +2187,17 @@ static void fan_update(uint32_t delta_ms)
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
-        /* 手动：按键调整 */
-        fix16_t adjust = (fix16_t)((int64_t)FAN_ADJUST_RATE_PER_MS_Q16 * delta_ms);
-        if (g_controls.decrease_input.stable_state) {
-            g_manual_target -= adjust;
-        }
-        if (g_controls.increase_input.stable_state) {
-            g_manual_target += adjust;
-        }
-        g_manual_target = fix16_clamp(g_manual_target, 0, FIX16_ONE);
-        if (g_manual_target < g_fan_min_ratio) {
-            g_manual_target = g_fan_min_ratio;
+        /* 手动：每次短按步进 1%（无连发），更易精确控制 */
+        const fix16_t MANUAL_STEP_Q16 = (FIX16_ONE / 100); /* 1% */
+        int step = 0;
+        if (g_click_dec) { step -= g_click_dec; g_click_dec = 0; }
+        if (g_click_inc) { step += g_click_inc; g_click_inc = 0; }
+        if (step != 0) {
+            fix16_t delta = (fix16_t)((int64_t)MANUAL_STEP_Q16 * step);
+            g_manual_target = fix16_clamp(g_manual_target + delta, 0, FIX16_ONE);
+            if (g_manual_target < g_fan_min_ratio) {
+                g_manual_target = g_fan_min_ratio;
+            }
         }
         /* Persist manual target occasionally when it changes notably */
         fix16_t diff = fix16_abs(g_manual_target - g_cfg_last_saved_manual);
