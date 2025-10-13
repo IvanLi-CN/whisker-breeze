@@ -614,6 +614,14 @@ typedef enum {
 static settings_mode_t g_settings_mode = SETTINGS_INACTIVE;
 static uint8_t         g_settings_index = 0; /* 0=min,1=max,2=sleep */
 
+__attribute__((noinline)) static void clamp_offset_to_band(void)
+{
+    int32_t min_off = (int32_t)TEMP_ABS_MIN_CX100 - (int32_t)g_auto_min_cx100;
+    int32_t max_off = (int32_t)TEMP_ABS_MAX_CX100 - (int32_t)g_auto_max_cx100;
+    if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
+    if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
+}
+
 static inline uint16_t ratio_to_q8_8(fix16_t r)
 {
     if (r <= 0) return 0u;
@@ -1839,6 +1847,8 @@ static void ui_update(uint32_t delta_ms)
                     if (new_max > TEMP_ABS_MAX_CX100) new_max = TEMP_ABS_MAX_CX100;
                     g_auto_max_cx100 = (int16_t)new_max;
                 }
+                /* Clamp offset to new band limits */
+                clamp_offset_to_band();
             } else if (g_settings_index == 1) {
                 int32_t v = (int32_t)g_auto_max_cx100 + (int32_t)step_units * 100;
                 if (v < TEMP_ABS_MIN_CX100) v = TEMP_ABS_MIN_CX100;
@@ -1850,6 +1860,8 @@ static void ui_update(uint32_t delta_ms)
                     if (new_min < TEMP_ABS_MIN_CX100) new_min = TEMP_ABS_MIN_CX100;
                     g_auto_min_cx100 = (int16_t)new_min;
                 }
+                /* Clamp offset to new band limits */
+                clamp_offset_to_band();
             } else {
                 int32_t s = (int32_t)(g_display_sleep_timeout_ms / 1000u) + (int32_t)step_units;
                 if (s < 5) s = 5;
@@ -1966,11 +1978,11 @@ static int32_t g_temp_band_accum_cx100 = 0;      /* legacy accumulator */
 
 static inline int16_t temp_band_low(void)
 {
-    return g_auto_min_cx100;
+    return (int16_t)(g_auto_min_cx100 + g_temp_band_offset_cx100);
 }
 static inline int16_t temp_band_high(void)
 {
-    return g_auto_max_cx100;
+    return (int16_t)(g_auto_max_cx100 + g_temp_band_offset_cx100);
 }
 
 static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
@@ -2142,7 +2154,27 @@ static void fan_update(uint32_t delta_ms)
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
-        /* AUTO: map temperature to target using adjustable [min,max] band. */
+        /* AUTO: allow HOT/COLD shift using SLOW/FAST to offset the configured [min,max]. */
+        int dir = 0;
+        if (g_controls.decrease_input.stable_state) dir += 1;  /* SLOW → hotter */
+        if (g_controls.increase_input.stable_state) dir -= 1;  /* FAST → colder */
+        if (dir != 0) {
+            int32_t delta = (int32_t)delta_ms * (int32_t)TEMP_BAND_ADJ_RATE_CX100_S * dir;
+            g_temp_band_accum_cx100 += delta;
+            while (g_temp_band_accum_cx100 >= 1000) {
+                g_temp_band_offset_cx100 += 1; /* +1 centi-°C */
+                g_temp_band_accum_cx100 -= 1000;
+            }
+            while (g_temp_band_accum_cx100 <= -1000) {
+                g_temp_band_offset_cx100 -= 1;
+                g_temp_band_accum_cx100 += 1000;
+            }
+            /* Clamp offset so that shifted [min,max] stays within absolute bounds. */
+            clamp_offset_to_band();
+            /* Persist occasionally */
+            persist_save_throttled("band", 1000u);
+        }
+        /* AUTO map temp against (min+offset, max+offset) */
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
@@ -2552,7 +2584,7 @@ int main(void)
         g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
         /* 将持久化的手动目标同步到运行期的“最近保存”字段，便于随时切入 MANUAL 时恢复 */
         g_cfg_last_saved_manual = g_restore_manual_target;
-        /* Legacy offset persisted for compatibility (not used for mapping). */
+        /* Legacy offset persisted for compatibility (now used as shift on configured band). */
         g_temp_band_offset_cx100 = cfg.temp_band_offset_cx100;
         /* Load adjustable band endpoints and sleep timeout */
         int32_t min_c = cfg.auto_min_cx100;
@@ -2569,6 +2601,8 @@ int main(void)
         }
         g_auto_min_cx100 = (int16_t)min_c;
         g_auto_max_cx100 = (int16_t)max_c;
+        /* Clamp offset to new band limits */
+        clamp_offset_to_band();
         uint32_t sleep_s = cfg.display_sleep_s;
         if (sleep_s < 5u) sleep_s = 30u; /* default if unset */
         if (sleep_s > 60u) sleep_s = 60u;
