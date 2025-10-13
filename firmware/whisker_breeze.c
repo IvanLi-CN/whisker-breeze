@@ -344,7 +344,7 @@ static void draw_settings_item(const char *label, const char *value, uint8_t y, 
 #define LOG_MIN_INTERVAL_MS       250u
 #endif
 
-#define MODE_DEBOUNCE_TICKS       3u   /* default for SLOW/FAST */
+#define MODE_DEBOUNCE_TICKS       2u   /* faster response for SLOW/FAST */
 #define HOLD_DEBOUNCE_TICKS       1u   /* MODE尽量灵敏，轻按也能触发 */
 #define LOOP_PERIOD_MS            10u
 
@@ -1748,8 +1748,6 @@ static void ui_update(uint32_t delta_ms)
     static bool     mode_long_fired = false; /* fire long event immediately upon threshold */
     static bool     prev_dec = false;
     static bool     prev_inc = false;
-    static uint32_t dec_rep_ms = 0u;
-    static uint32_t inc_rep_ms = 0u;
 
     bool dec_now = g_controls.decrease_input.stable_state;
     bool inc_now = g_controls.increase_input.stable_state;
