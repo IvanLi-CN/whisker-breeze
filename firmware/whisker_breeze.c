@@ -156,18 +156,28 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 /* 无 */
 
+static inline void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
+{
+    uint8_t y2 = (uint8_t)(y + h);
+    uint8_t x2 = (uint8_t)(x + w);
+    for (uint8_t yy = y; yy < y2; ++yy) {
+        for (uint8_t xx = x; xx < x2; ++xx) {
+            ssd1306_drawPixel((uint32_t)xx, (uint32_t)yy, 1);
+        }
+    }
+}
+
 static void draw_settings_item(const char *label, const char *value, uint8_t y, bool invert_line, bool invert_value)
 {
     uint8_t x = DISP_ORIGIN_X;
     size_t l_len = strlen(label);
     size_t v_len = strlen(value);
+    /* add vertical padding ±1px around 8px font for better readability */
+    uint8_t y_pad = (y > 0) ? (uint8_t)(y - 1) : 0;
+    uint8_t line_h = 10; /* 8px font + 2px padding */
     if (invert_line) {
-        /* Invert entire line: fill then draw inverted text */
-        for (uint8_t yy = 0; yy < 8; ++yy) {
-            for (uint8_t xx = 0; xx < SSD1306_W; ++xx) {
-                ssd1306_drawPixel((uint32_t)x + xx, (uint32_t)y + yy, 1);
-            }
-        }
+        /* Invert entire line area with padding */
+        fill_rect(x, y_pad, SSD1306_W, line_h);
         /* Draw full text in color=0 over white background */
         ssd1306_drawstr(x, y, (char *)label, 0);
         ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 0);
@@ -175,14 +185,10 @@ static void draw_settings_item(const char *label, const char *value, uint8_t y, 
         /* Draw label normally */
         ssd1306_drawstr(x, y, (char *)label, 1);
         if (invert_value) {
-            /* Fill value area and draw value inverted */
+            /* Fill value area with padding and draw value inverted */
             uint8_t vx = (uint8_t)(x + (uint8_t)(l_len * 8));
             uint8_t vw = (uint8_t)((v_len * 8u) > SSD1306_W ? SSD1306_W : (v_len * 8u));
-            for (uint8_t yy = 0; yy < 8; ++yy) {
-                for (uint8_t xx = 0; xx < vw; ++xx) {
-                    ssd1306_drawPixel((uint32_t)vx + xx, (uint32_t)y + yy, 1);
-                }
-            }
+            fill_rect(vx, y_pad, vw, line_h);
             ssd1306_drawstr(vx, y, (char *)value, 0);
         } else {
             ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 1);
@@ -1110,11 +1116,7 @@ static bool debounce_update_ticks(debounce_t *db, bool raw_level, uint8_t ticks)
     return false;
 }
 
-/* 兼容旧调用，默认使用 MODE_DEBOUNCE_TICKS */
-static bool debounce_update(debounce_t *db, bool raw_level)
-{
-    return debounce_update_ticks(db, raw_level, MODE_DEBOUNCE_TICKS);
-}
+/* （移除旧的兼容包装，节省空间） */
 
 /* -------------------------------------------------------------------------- */
 /* Display helpers                                                            */
@@ -1205,15 +1207,15 @@ static void display_render(void)
         int min_c = g_auto_min_cx100 / 100;
         int max_c = g_auto_max_cx100 / 100;
         uint32_t sleep_s = g_display_sleep_timeout_ms / 1000u;
-        snprintf(v0, sizeof v0, "%dC", min_c);
-        snprintf(v1, sizeof v1, "%dC", max_c);
-        snprintf(v2, sizeof v2, "%lus", (unsigned long)sleep_s);
+        snprintf(v0, sizeof v0, "%d", min_c);
+        snprintf(v1, sizeof v1, "%d", max_c);
+        snprintf(v2, sizeof v2, "%lu", (unsigned long)sleep_s);
 
         bool editing = (g_settings_mode == SETTINGS_EDIT);
-        /* Line positions: y=8,16,24 */
-        draw_settings_item("Lo ", v0, (uint8_t)(DISP_ORIGIN_Y + 8),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
-        draw_settings_item("Hi ", v1, (uint8_t)(DISP_ORIGIN_Y + 16), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
-        draw_settings_item("Slp ", v2, (uint8_t)(DISP_ORIGIN_Y + 24), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+        /* Line positions with extra line-height: y=6,18,30 */
+        draw_settings_item("L", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("H", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("S", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
 
         ssd1306_flush_window();
         return;
@@ -1223,23 +1225,19 @@ static void display_render(void)
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
     uint32_t rpm_now = (g_fan.rpm_smooth != 0u) ? g_fan.rpm_smooth : g_fan.rpm;
 
-    snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
+    snprintf(line, sizeof line, "S%3u", (unsigned)set_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
 
-    snprintf(line, sizeof line, "Out %3u%%", (unsigned)out_pct);
+    snprintf(line, sizeof line, "O%3u", (unsigned)out_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 8, line, 1);
 
-    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
+    snprintf(line, sizeof line, "R%4lu", (unsigned long)rpm_now);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
 
     /* 第四行：显示控制模式（不加标签）。AUTO/Manual/Calib */
-    if (g_mode == CONTROL_MODE_TEMP) {
-        snprintf(line, sizeof line, "Auto");
-    } else if (g_mode == CONTROL_MODE_MANUAL) {
-        snprintf(line, sizeof line, "Manual");
-    } else {
-        snprintf(line, sizeof line, "Calib");
-    }
+    if (g_mode == CONTROL_MODE_TEMP) { snprintf(line, sizeof line, "A"); }
+    else if (g_mode == CONTROL_MODE_MANUAL) { snprintf(line, sizeof line, "M"); }
+    else { snprintf(line, sizeof line, "C"); }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
     /* 第五行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
@@ -1249,17 +1247,15 @@ static void display_render(void)
         if (mv < 0) mv = 0; /* Clamp to 0 for display */
         if (ma < 0) ma = 0;
         long v_int = (long)(mv / 1000);
-        long v_dec1 = (long)((mv % 1000 + 50) / 100); /* round to 0.1V */
-        if (v_dec1 >= 10) { v_int += 1; v_dec1 -= 10; }
         long ma_int = (long)ma; /* already rounded to 1 mA in INA driver */
         if (ma_int < 0) ma_int = 0;
         if (ma_int > 9999) ma_int = 9999; /* clamp to fit width */
-        /* e.g. "12.3V 450mA" -> fits within 12 chars */
-        snprintf(line, sizeof line, "%ld.%ldV %ldmA",
-                 v_int, v_dec1, ma_int);
+        /* Compact: Vxx mA */
+        snprintf(line, sizeof line, "V%ld %ld",
+                 v_int, ma_int);
     } else {
-        /* 传感器无效时显示空值，不加任何标签 */
-        snprintf(line, sizeof line, "--.-V ----mA");
+        /* 传感器无效时显示空值 */
+        snprintf(line, sizeof line, "--.- ----");
     }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
 
@@ -1703,11 +1699,6 @@ static void controls_update(void)
     bool inc_rise = (!s_last_inc) && inc_now;
     bool hold_rise = (!s_last_hold) && hold_now;
 
-    /* 原始电平的上升沿检测（不经去抖），作为兜底触发 MODE 切换与诊断 */
-    static bool s_last_hold_raw = false;
-    bool hold_raw_rise = (!s_last_hold_raw) && hold_pressed;
-    s_last_hold_raw = hold_pressed;
-
     /* 记录稳定态按键掩码变化以便定位键值读取问题（0b SLOW|MODE|FAST）。*/
     static uint8_t s_last_stable_mask = 0u;
     uint8_t stable_mask = (dec_now ? 0x1u : 0u) | (hold_now ? 0x2u : 0u) | (inc_now ? 0x4u : 0u);
@@ -1755,6 +1746,7 @@ static void ui_update(uint32_t delta_ms)
     static bool     mode_long_fired = false; /* fire long event immediately upon threshold */
     static bool     prev_dec = false;
     static bool     prev_inc = false;
+    static uint8_t  last_raw_mask_ui = 0u;
     static uint32_t dec_rep_ms = 0u;
     static uint32_t inc_rep_ms = 0u;
 
@@ -1825,15 +1817,20 @@ static void ui_update(uint32_t delta_ms)
     /* Rising edges for SLOW/FAST */
     bool dec_rise = (!prev_dec) && dec_now;
     bool inc_rise = (!prev_inc) && inc_now;
+    /* Also consider raw (non-debounced) rising edges to capture short taps */
+    uint8_t raw_now = g_controls_raw_mask;
+    bool dec_raw_rise = ((last_raw_mask_ui & 0x1u) == 0) && ((raw_now & 0x1u) != 0);
+    bool inc_raw_rise = ((last_raw_mask_ui & 0x4u) == 0) && ((raw_now & 0x4u) != 0);
     prev_dec = dec_now;
     prev_inc = inc_now;
+    last_raw_mask_ui = raw_now;
 
     /* Selection movement */
     if (g_settings_mode == SETTINGS_SELECT) {
-        if (dec_rise) {
+        if (dec_rise || dec_raw_rise) {
             g_settings_index = (uint8_t)((g_settings_index + 3 - 1) % 3);
         }
-        if (inc_rise) {
+        if (inc_rise || inc_raw_rise) {
             g_settings_index = (uint8_t)((g_settings_index + 1) % 3);
         }
     }
