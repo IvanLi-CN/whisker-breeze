@@ -196,6 +196,28 @@ static void draw_settings_item(const char *label, const char *value, uint8_t y, 
     }
 }
 
+/* Generic auto-repeat helper: returns number of extra steps (>=0) to apply.
+ * state: 0=idle, 1=initial (waiting), 2=repeat */
+static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, uint8_t *state,
+                           uint16_t initial_ms, uint16_t interval_ms)
+{
+    int8_t steps = 0;
+    if (pressed) {
+        if (*state == 0u) {
+            *state = 1u; *hold_ms = 0u; steps = 1; /* first tap */
+        } else if (*state == 1u) {
+            uint32_t t = *hold_ms + delta_ms;
+            if (t >= initial_ms) { *state = 2u; *hold_ms = t - initial_ms; }
+            else { *hold_ms = t; }
+        } else {
+            uint32_t t = *hold_ms + delta_ms;
+            while (t >= interval_ms) { steps++; t -= interval_ms; }
+            *hold_ms = t;
+        }
+    } else { *state = 0u; *hold_ms = 0u; }
+    return steps;
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Hardware bindings                                                          */
@@ -619,10 +641,6 @@ typedef enum {
 } settings_mode_t;
 static settings_mode_t g_settings_mode = SETTINGS_INACTIVE;
 static uint8_t         g_settings_index = 0; /* 0=min,1=max,2=sleep */
-
-/* One-tap click counters (debounced edges), only used when not in settings */
-static uint8_t g_click_dec = 0; /* SLOW taps */
-static uint8_t g_click_inc = 0; /* FAST taps */
 
 __attribute__((noinline)) static void clamp_offset_to_band(void)
 {
@@ -1217,9 +1235,9 @@ static void display_render(void)
 
         bool editing = (g_settings_mode == SETTINGS_EDIT);
         /* Line positions with extra line-height: y=6,18,30 */
-        draw_settings_item("Min ", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
-        draw_settings_item("Max ", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
-        draw_settings_item("Sleep ", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+        draw_settings_item("Min", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("Max", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("Sleep", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
 
         ssd1306_flush_window();
         return;
@@ -1251,14 +1269,12 @@ static void display_render(void)
         if (mv < 0) mv = 0; /* Clamp to 0 for display */
         if (ma < 0) ma = 0;
         long v_int = (long)(mv / 1000);
-        long v_dec1 = (long)((mv % 1000 + 50) / 100); /* round to 0.1V */
-        if (v_dec1 >= 10) { v_int += 1; v_dec1 -= 10; }
         long ma_int = (long)ma; /* already rounded to 1 mA in INA driver */
         if (ma_int < 0) ma_int = 0;
         if (ma_int > 9999) ma_int = 9999; /* clamp to fit width */
-        /* e.g. "12.3V 450mA" -> fits within 12 chars */
-        snprintf(line, sizeof line, "%ld.%ldV %ldmA",
-                 v_int, v_dec1, ma_int);
+        /* Compact: integer volts to save space */
+        snprintf(line, sizeof line, "V%ld %ldmA",
+                 v_int, ma_int);
     } else {
         /* 传感器无效时显示空值，不加任何标签 */
         snprintf(line, sizeof line, "--.-V ----mA");
@@ -1731,12 +1747,6 @@ static void controls_update(void)
         g_display_idle_ms = 0u;
     }
 
-    /* 累积单击事件（仅在非设置界面），供手动模式做离散步进 */
-    if (g_settings_mode == SETTINGS_INACTIVE) {
-        if (dec_rise && g_click_dec < 250) g_click_dec++;
-        if (inc_rise && g_click_inc < 250) g_click_inc++;
-    }
-
     /* MODE 的短按/长按在 ui_update() 中统一处理，这里不再直接切换模式。 */
 
     s_last_dec = dec_now;
@@ -1840,9 +1850,20 @@ static void ui_update(uint32_t delta_ms)
 
     /* Value editing */
     if (g_settings_mode == SETTINGS_EDIT) {
+        enum { EDIT_REPEAT_INITIAL_MS = 250u, EDIT_REPEAT_INTERVAL_MS = 120u };
+        static uint32_t dec_hold_ms = 0u, inc_hold_ms = 0u;
+        static uint8_t  dec_state = 0u,  inc_state = 0u;
+
         int step_units = 0; /* negative for decrease, positive for increase */
-        if (dec_rise) step_units -= 1;
-        if (inc_rise) step_units += 1;
+        /* first tap/hold managed by helper */
+        int8_t add_dec = repeat_steps(g_controls.decrease_input.stable_state, delta_ms,
+                                       &dec_hold_ms, &dec_state,
+                                       EDIT_REPEAT_INITIAL_MS, EDIT_REPEAT_INTERVAL_MS);
+        int8_t add_inc = repeat_steps(g_controls.increase_input.stable_state, delta_ms,
+                                       &inc_hold_ms, &inc_state,
+                                       EDIT_REPEAT_INITIAL_MS, EDIT_REPEAT_INTERVAL_MS);
+        step_units += (int)add_inc;
+        step_units -= (int)add_dec;
 
         if (step_units != 0) {
             if (g_settings_index == 0) {
@@ -2187,11 +2208,22 @@ static void fan_update(uint32_t delta_ms)
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
-        /* 手动：每次短按步进 1%（无连发），更易精确控制 */
+        /* 手动：1% 步进，支持连发（初始延时+重复节拍），更稳定好控 */
         const fix16_t MANUAL_STEP_Q16 = (FIX16_ONE / 100); /* 1% */
+        enum { MAN_REPEAT_INITIAL_MS = 250u, MAN_REPEAT_INTERVAL_MS = 120u };
+        static uint32_t man_dec_ms = 0u, man_inc_ms = 0u;
+        static uint8_t  man_dec_state = 0u, man_inc_state = 0u;
+
         int step = 0;
-        if (g_click_dec) { step -= g_click_dec; g_click_dec = 0; }
-        if (g_click_inc) { step += g_click_inc; g_click_inc = 0; }
+        int8_t add_dec = repeat_steps(g_controls.decrease_input.stable_state, delta_ms,
+                                       &man_dec_ms, &man_dec_state,
+                                       MAN_REPEAT_INITIAL_MS, MAN_REPEAT_INTERVAL_MS);
+        int8_t add_inc = repeat_steps(g_controls.increase_input.stable_state, delta_ms,
+                                       &man_inc_ms, &man_inc_state,
+                                       MAN_REPEAT_INITIAL_MS, MAN_REPEAT_INTERVAL_MS);
+        step += (int)add_inc;
+        step -= (int)add_dec;
+
         if (step != 0) {
             fix16_t delta = (fix16_t)((int64_t)MANUAL_STEP_Q16 * step);
             g_manual_target = fix16_clamp(g_manual_target + delta, 0, FIX16_ONE);
