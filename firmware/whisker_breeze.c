@@ -170,9 +170,11 @@ static inline void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
 static void draw_settings_item(const char *label, const char *value, uint8_t y, bool invert_line, bool invert_value)
 {
     /* Two-column layout: col0=labels (left), col1=values (right) */
-    const uint8_t col_w = (uint8_t)(SSD1306_W / 2);
+    /* Column widths: 66% (labels), 34% (values) */
+    const uint8_t col0_w = (uint8_t)(((uint16_t)SSD1306_W * 66u) / 100u);
+    const uint8_t col1_w = (uint8_t)(SSD1306_W - col0_w);
     const uint8_t x_label = DISP_ORIGIN_X;
-    const uint8_t x_value = (uint8_t)(DISP_ORIGIN_X + col_w);
+    const uint8_t x_value = (uint8_t)(DISP_ORIGIN_X + col0_w);
     size_t v_len = strlen(value);
     /* add vertical padding ±1px around 8px font for better readability */
     uint8_t y_pad = (y > 0) ? (uint8_t)(y - 1) : 0;
@@ -189,7 +191,7 @@ static void draw_settings_item(const char *label, const char *value, uint8_t y, 
         if (invert_value) {
             /* Fill value area with padding and draw value inverted */
             uint8_t vx = x_value;
-            uint8_t vw = (uint8_t)((v_len * 8u) > col_w ? col_w : (v_len * 8u));
+            uint8_t vw = (uint8_t)((v_len * 8u) > col1_w ? col1_w : (v_len * 8u));
             fill_rect(vx, y_pad, vw, line_h);
             ssd1306_drawstr(vx, y, (char *)value, 0);
         } else {
