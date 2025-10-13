@@ -169,29 +169,31 @@ static inline void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
 
 static void draw_settings_item(const char *label, const char *value, uint8_t y, bool invert_line, bool invert_value)
 {
-    uint8_t x = DISP_ORIGIN_X;
-    size_t l_len = strlen(label);
+    /* Two-column layout: col0=labels (left), col1=values (right) */
+    const uint8_t col_w = (uint8_t)(SSD1306_W / 2);
+    const uint8_t x_label = DISP_ORIGIN_X;
+    const uint8_t x_value = (uint8_t)(DISP_ORIGIN_X + col_w);
     size_t v_len = strlen(value);
     /* add vertical padding ±1px around 8px font for better readability */
     uint8_t y_pad = (y > 0) ? (uint8_t)(y - 1) : 0;
     uint8_t line_h = 10; /* 8px font + 2px padding */
     if (invert_line) {
         /* Invert entire line area with padding */
-        fill_rect(x, y_pad, SSD1306_W, line_h);
+        fill_rect(DISP_ORIGIN_X, y_pad, SSD1306_W, line_h);
         /* Draw full text in color=0 over white background */
-        ssd1306_drawstr(x, y, (char *)label, 0);
-        ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 0);
+        ssd1306_drawstr(x_label, y, (char *)label, 0);
+        ssd1306_drawstr(x_value, y, (char *)value, 0);
     } else {
         /* Draw label normally */
-        ssd1306_drawstr(x, y, (char *)label, 1);
+        ssd1306_drawstr(x_label, y, (char *)label, 1);
         if (invert_value) {
             /* Fill value area with padding and draw value inverted */
-            uint8_t vx = (uint8_t)(x + (uint8_t)(l_len * 8));
-            uint8_t vw = (uint8_t)((v_len * 8u) > SSD1306_W ? SSD1306_W : (v_len * 8u));
+            uint8_t vx = x_value;
+            uint8_t vw = (uint8_t)((v_len * 8u) > col_w ? col_w : (v_len * 8u));
             fill_rect(vx, y_pad, vw, line_h);
             ssd1306_drawstr(vx, y, (char *)value, 0);
         } else {
-            ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 1);
+            ssd1306_drawstr(x_value, y, (char *)value, 1);
         }
     }
 }
