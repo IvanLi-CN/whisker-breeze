@@ -304,7 +304,8 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define LOG_MIN_INTERVAL_MS       250u
 #endif
 
-#define MODE_DEBOUNCE_TICKS       3u
+#define MODE_DEBOUNCE_TICKS       3u   /* default for SLOW/FAST */
+#define HOLD_DEBOUNCE_TICKS       1u   /* MODE尽量灵敏，轻按也能触发 */
 #define LOOP_PERIOD_MS            10u
 
 #define INA_INT_ACTIVE_LOW        1
@@ -1027,22 +1028,28 @@ static void ina226_update(uint32_t delta_ms)
 /* -------------------------------------------------------------------------- */
 /* Debounce helpers                                                           */
 /* -------------------------------------------------------------------------- */
-static bool debounce_update(debounce_t *db, bool raw_level)
+static bool debounce_update_ticks(debounce_t *db, bool raw_level, uint8_t ticks)
 {
     if (raw_level == db->stable_state) {
         db->counter = 0;
         return false;
     }
 
-    if (db->counter < MODE_DEBOUNCE_TICKS) {
+    if (db->counter < ticks) {
         db->counter++;
-        if (db->counter >= MODE_DEBOUNCE_TICKS) {
+        if (db->counter >= ticks) {
             db->stable_state = raw_level;
             db->counter = 0;
             return true;
         }
     }
     return false;
+}
+
+/* 兼容旧调用，默认使用 MODE_DEBOUNCE_TICKS */
+static bool debounce_update(debounce_t *db, bool raw_level)
+{
+    return debounce_update_ticks(db, raw_level, MODE_DEBOUNCE_TICKS);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1588,9 +1595,10 @@ static void controls_update(void)
     }
     g_controls_raw_mask = raw_mask;
 
-    debounce_update(&g_controls.decrease_input, dec_pressed);
-    debounce_update(&g_controls.increase_input, inc_pressed);
-    debounce_update(&g_controls.hold_input, hold_pressed);
+    /* SLOW/FAST 使用默认去抖，MODE 使用更快去抖以提高轻按识别率 */
+    debounce_update_ticks(&g_controls.decrease_input, dec_pressed, MODE_DEBOUNCE_TICKS);
+    debounce_update_ticks(&g_controls.increase_input, inc_pressed, MODE_DEBOUNCE_TICKS);
+    debounce_update_ticks(&g_controls.hold_input, hold_pressed, HOLD_DEBOUNCE_TICKS);
 
     /* 基于稳定态计算上升沿，用于唤醒与模式切换判定 */
     static bool s_last_dec = false;
@@ -1605,19 +1613,38 @@ static void controls_update(void)
     bool inc_rise = (!s_last_inc) && inc_now;
     bool hold_rise = (!s_last_hold) && hold_now;
 
-    /* 熄屏下：任意键上升沿立即点亮；中键事件被消耗，其它键不消耗 */
+    /* 原始电平的上升沿检测（不经去抖），作为兜底触发 MODE 切换与诊断 */
+    static bool s_last_hold_raw = false;
+    bool hold_raw_rise = (!s_last_hold_raw) && hold_pressed;
+    s_last_hold_raw = hold_pressed;
+
+    /* 记录稳定态按键掩码变化以便定位键值读取问题（0b SLOW|MODE|FAST）。*/
+    static uint8_t s_last_stable_mask = 0u;
+    uint8_t stable_mask = (dec_now ? 0x1u : 0u) | (hold_now ? 0x2u : 0u) | (inc_now ? 0x4u : 0u);
+    if (stable_mask != s_last_stable_mask) {
+        s_last_stable_mask = stable_mask;
+        emit_log("[key]%u", (unsigned)stable_mask);
+    }
+
+    /* 记录原始电平变化：仅关心 MODE（2）位，便于定位硬件/采样问题 */
+    static uint8_t s_last_raw_mask = 0u;
+    uint8_t raw_mask_now = g_controls_raw_mask;
+    if (raw_mask_now != s_last_raw_mask) {
+        s_last_raw_mask = raw_mask_now;
+        emit_log("[keyr]%u", (unsigned)raw_mask_now);
+    }
+
+    /* 熄屏下：任意键上升沿立即点亮；中键不再吞掉事件，以便可直接切换模式 */
     if (!g_display_awake && (dec_rise || inc_rise || hold_rise)) {
         display_set_awake(true);
         g_display_idle_ms = 0u;
-        if (hold_rise) {
-            /* 吞掉中键的这次上升沿，不进行模式切换 */
-            hold_rise = false;
-        }
     }
 
-    /* 亮屏时，处理中键的模式切换（仅测速完成后允许） */
-    if (hold_rise) {
+    /* 亮屏时，处理中键的模式切换（仅测速完成后允许）；
+     * 除去抖上升沿外，允许原始上升沿兜底触发，避免漏检 */
+    if (hold_rise || hold_raw_rise) {
         if (g_mode != CONTROL_MODE_CALIB) {
+            /* 切换模式：从 AUTO → MANUAL 时，保留当前目标（即 AUTO 的当前值作为手动初始值） */
             g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
             emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
             /* Persist mode change & latest manual target */
@@ -1910,8 +1937,6 @@ static void fan_update(uint32_t delta_ms)
         g_fan.rpm_valid = false;
         return;
     }
-
-    controls_update();
 
     /* 三模式：测速→温控/手动；MODE只在温控/手动切换 */
     if (g_mode == CONTROL_MODE_CALIB) {
@@ -2347,6 +2372,8 @@ int main(void)
     if (eeprom_cfg_load(&cfg)) {
         g_restore_mode = (cfg.last_mode == CFG_MODE_MANUAL) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
         g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
+        /* 将持久化的手动目标同步到运行期的“最近保存”字段，便于随时切入 MANUAL 时恢复 */
+        g_cfg_last_saved_manual = g_restore_manual_target;
         /* Clamp loaded band offset to allowed range */
         int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;
         int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100);
@@ -2399,6 +2426,9 @@ int main(void)
         }
 
         g_uptime_ms += delta_ms;
+
+        /* 先处理按键，保证在任何供电/转态下都能识别 MODE 切换与唤醒 */
+        controls_update();
 
         power_update();
         tach_update(delta_ms);
