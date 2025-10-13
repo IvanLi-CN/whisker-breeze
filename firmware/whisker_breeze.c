@@ -683,10 +683,10 @@ static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
 static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
-/* 屏幕省电：默认亮屏，上电后 5 s 无按键则熄屏；任意按键唤醒。
+/* 屏幕省电：默认亮屏，上电后 30 s 无按键则熄屏；任意按键唤醒。
  * - 熄屏下，按中键仅唤醒且消耗该次事件；其它键唤醒且不消耗。
  */
-#define DISPLAY_SLEEP_TIMEOUT_MS 5000u
+#define DISPLAY_SLEEP_TIMEOUT_MS 30000u
 static bool     g_display_awake = true;     /* 运行期亮/熄屏状态 */
 static uint32_t g_display_idle_ms = 0u;     /* 距离上次有效输入的空闲时间 */
 /* g_uptime_ms moved above into the time base section */
