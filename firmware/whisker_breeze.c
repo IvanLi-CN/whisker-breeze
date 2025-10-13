@@ -7,6 +7,7 @@
 
 #include "i2c_lowlevel.h"
 #include "eeprom_font_storage.h"
+#include "eeprom_config.h"
 
 typedef int32_t fix16_t;
 
@@ -289,7 +290,8 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define INA226_MAX_SAMPLE_FAILURES     3u
 #define INA226_PANIC_GRACE_MS          200u
 
-#define I2C1_SHARED_BUS_TARGET_HZ 400000u
+/* Keep initial I2C conservative to maximize compatibility; can raise later. */
+#define I2C1_SHARED_BUS_TARGET_HZ 100000u
 
 #define LOG_SAMPLE_PERIOD_MS      1000u
 #define LOG_FORCE_INTERVAL_MS     5000u
@@ -302,7 +304,8 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define LOG_MIN_INTERVAL_MS       250u
 #endif
 
-#define MODE_DEBOUNCE_TICKS       3u
+#define MODE_DEBOUNCE_TICKS       3u   /* default for SLOW/FAST */
+#define HOLD_DEBOUNCE_TICKS       1u   /* MODE尽量灵敏，轻按也能触发 */
 #define LOOP_PERIOD_MS            10u
 
 #define INA_INT_ACTIVE_LOW        1
@@ -547,6 +550,123 @@ typedef enum {
 /* 默认先测速，完成后进入温控；MODE 只在 TEMP/MANUAL 间切换 */
 static control_mode_t g_mode = CONTROL_MODE_CALIB;
 
+/* Persisted state restore (applied after calibration) */
+static control_mode_t g_restore_mode = CONTROL_MODE_TEMP;
+static fix16_t        g_restore_manual_target = FIX16_ONE;
+static bool           g_restore_pending = false;
+
+/* Config persistence throttle */
+static uint32_t g_cfg_last_save_ms = 0u;
+static fix16_t  g_cfg_last_saved_manual = 0; /* initialized on first save */
+
+/* Forward decls for helpers used before their full definitions */
+static void emit_log(const char *fmt, ...);
+/* Temperature-band offset used by AUTO mapping; full definition appears below. */
+static int16_t g_temp_band_offset_cx100;
+
+static inline uint16_t ratio_to_q8_8(fix16_t r)
+{
+    if (r <= 0) return 0u;
+    if (r >= FIX16_ONE) return 256u;
+    return (uint16_t)(((int64_t)r * 256 + (FIX16_ONE / 2)) >> FIX16_FRAC_BITS);
+}
+
+static inline fix16_t q8_8_to_ratio(uint16_t q)
+{
+    if (q >= 256u) return FIX16_ONE;
+    return (fix16_t)(((int64_t)q << FIX16_FRAC_BITS) / 256);
+}
+
+static void persist_save_now(const char *tag)
+{
+    (void)tag;
+    eeprom_runtime_cfg_t cfg;
+    cfg.version = 1u;
+    cfg.last_mode = (g_mode == CONTROL_MODE_MANUAL) ? CFG_MODE_MANUAL : CFG_MODE_TEMP;
+    cfg.manual_ratio_q8_8 = ratio_to_q8_8(g_manual_target);
+    cfg.temp_band_offset_cx100 = g_temp_band_offset_cx100;
+    if (eeprom_cfg_save(&cfg)) {
+        g_cfg_last_save_ms = g_uptime_ms;
+        g_cfg_last_saved_manual = g_manual_target;
+        emit_log("[cfg]save");
+    }
+}
+
+static void persist_save_throttled(const char *tag, uint32_t min_interval_ms)
+{
+    uint32_t now = g_uptime_ms;
+    if ((now - g_cfg_last_save_ms) >= min_interval_ms) {
+        persist_save_now(tag);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* I2C diagnostics (optional)                                                 */
+/* -------------------------------------------------------------------------- */
+#if I2C_DIAG_ENABLE
+static void i2c_diag_log_levels(const char *stage)
+{
+    int sda = funDigitalRead(PIN_I2C_SDA);
+    int scl = funDigitalRead(PIN_I2C_SCL);
+    int busy = (I2C1->STAR2 & I2C_STAR2_BUSY) ? 1 : 0;
+    emit_log("[i2c]%s,sda=%d,scl=%d,busy=%d", stage, sda, scl, busy);
+}
+
+static bool i2c_probe_addr(uint8_t addr7)
+{
+    if (!i2c1_wait_not_busy()) {
+        return false;
+    }
+    I2C1->CTLR1 |= I2C_CTLR1_START;
+    if (!i2c1_wait_flag(0x00030001u)) {
+        return false;
+    }
+    I2C1->DATAR = (uint16_t)((uint16_t)addr7 << 1);
+    bool ok = i2c1_wait_flag(0x00070082u);
+    /* Issue STOP regardless */
+    I2C1->CTLR1 |= I2C_CTLR1_STOP;
+    return ok;
+}
+#endif
+
+/* Optional stuck-bus recovery (SDA held low at boot) */
+#if I2C_RECOVER_ENABLE
+static void i2c_bus_recover(void)
+{
+    /* Disable I2C peripheral to get direct GPIO control */
+    I2C1->CTLR1 &= ~I2C_CTLR1_PE;
+
+    /* Configure pins: SCL as OD output, SDA as input with pull-up */
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_OD);
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_IN_PUPD);
+    funDigitalWrite(PIN_I2C_SDA, FUN_HIGH);
+
+    /* Pulse SCL until SDA releases (max 12 clocks). */
+    for (int i = 0; i < 12; ++i) {
+        if (funDigitalRead(PIN_I2C_SDA)) break;
+        funDigitalWrite(PIN_I2C_SCL, FUN_LOW);
+        Delay_Ms(1);
+        funDigitalWrite(PIN_I2C_SCL, FUN_HIGH);
+        Delay_Ms(1);
+    }
+
+    /* STOP: SDA low -> SCL high -> SDA high */
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_OD);
+    funDigitalWrite(PIN_I2C_SDA, FUN_LOW);
+    Delay_Ms(1);
+    funDigitalWrite(PIN_I2C_SCL, FUN_HIGH);
+    Delay_Ms(1);
+    funDigitalWrite(PIN_I2C_SDA, FUN_HIGH);
+
+    /* Restore AF-OD and re-enable I2C */
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    I2C1->CTLR1 |= I2C_CTLR1_PE;
+    I2C1->CTLR1 |= I2C_CTLR1_ACK;
+    i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
+}
+#endif
+
 static void fan_calibration_reset(void)
 {
     g_fan_calibration.active = true;
@@ -667,45 +787,33 @@ static void reset_fan_log_timer(void)
 /* -------------------------------------------------------------------------- */
 /* Logging helpers                                                            */
 /* -------------------------------------------------------------------------- */
+#ifndef WB_LOG_ENABLE
+#define WB_LOG_ENABLE 1
+#endif
+
 static void emit_log(const char *fmt, ...)
 {
-    char buffer[160];
-    va_list args;
-    va_start(args, fmt);
-    int written = mini_vsnprintf(buffer, sizeof buffer, fmt, args);
-    va_end(args);
-
-    if (written < 0) {
-        return;
-    }
-
-    if (written >= (int)sizeof buffer) {
-        written = (int)sizeof buffer - 1;
-        buffer[written] = '\0';
-    }
-
-    buffer[written] = '\0';
-
-    char line[200];
-    uint32_t seconds = g_uptime_ms / 1000u;
-    uint32_t millis = g_uptime_ms % 1000u;
-    mini_snprintf(line, sizeof line, "[%05lu.%03lu] %s",
-                  (unsigned long)seconds,
-                  (unsigned long)millis,
-                  buffer);
-
-    /* Minimal fix: if no debugger, skip logging to avoid blocking. */
+#if WB_LOG_ENABLE
     if (!DidDebuggerAttach()) {
         return;
     }
-
+    uint32_t seconds = g_uptime_ms / 1000u;
+    uint32_t millis = g_uptime_ms % 1000u;
     while (!DebugPrintfBufferFree()) {
         poll_input();
     }
-    printf("%s\r\n", line);
+    printf("[%05lu.%03lu] ", (unsigned long)seconds, (unsigned long)millis);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\r\n");
     while (!DebugPrintfBufferFree()) {
         poll_input();
     }
+#else
+    (void)fmt;
+#endif
 }
 
 /* panic() removed to save flash; all INA paths now fail-soft with LED fault. */
@@ -920,22 +1028,28 @@ static void ina226_update(uint32_t delta_ms)
 /* -------------------------------------------------------------------------- */
 /* Debounce helpers                                                           */
 /* -------------------------------------------------------------------------- */
-static bool debounce_update(debounce_t *db, bool raw_level)
+static bool debounce_update_ticks(debounce_t *db, bool raw_level, uint8_t ticks)
 {
     if (raw_level == db->stable_state) {
         db->counter = 0;
         return false;
     }
 
-    if (db->counter < MODE_DEBOUNCE_TICKS) {
+    if (db->counter < ticks) {
         db->counter++;
-        if (db->counter >= MODE_DEBOUNCE_TICKS) {
+        if (db->counter >= ticks) {
             db->stable_state = raw_level;
             db->counter = 0;
             return true;
         }
     }
     return false;
+}
+
+/* 兼容旧调用，默认使用 MODE_DEBOUNCE_TICKS */
+static bool debounce_update(debounce_t *db, bool raw_level)
+{
+    return debounce_update_ticks(db, raw_level, MODE_DEBOUNCE_TICKS);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1315,7 +1429,8 @@ static void led_update(uint32_t delta_ms)
         uint32_t pct = led_pct_from_duty();
         uint8_t pulses = (uint8_t)((pct * 10u + 99u) / 100u); /* 0..10 -> round up per bin */
         g_led.pulses_target = clamp_u8(pulses == 0 ? 1 : pulses, 1, 10);
-        emit_log("[led]%u", (unsigned)g_led.pulses_target);
+        /* Verbose LED pulse count log can be enabled if needed. */
+        /* emit_log("[led]%u", (unsigned)g_led.pulses_target); */
         led_on();
         return;
     }
@@ -1373,6 +1488,12 @@ static void led_update(uint32_t delta_ms)
 static void board_init(void)
 {
     funGpioInitAll();
+
+    /* Ensure I2C1 clock and pins are configured up-front so any early
+     * EEPROM/INA access has valid AF-OD on PC1/PC2. */
+    RCC->APB1PCENR |= RCC_APB1Periph_I2C1;
+    funPinMode(PIN_I2C_SDA, GPIO_CFGLR_OUT_10Mhz_AF_OD);
+    funPinMode(PIN_I2C_SCL, GPIO_CFGLR_OUT_10Mhz_AF_OD);
 
     funPinMode(PIN_DISPLAY_PWR, GPIO_CFGLR_OUT_10Mhz_PP);
     funPinMode(PIN_DISPLAY_RESET, GPIO_CFGLR_OUT_10Mhz_PP);
@@ -1474,9 +1595,10 @@ static void controls_update(void)
     }
     g_controls_raw_mask = raw_mask;
 
-    debounce_update(&g_controls.decrease_input, dec_pressed);
-    debounce_update(&g_controls.increase_input, inc_pressed);
-    debounce_update(&g_controls.hold_input, hold_pressed);
+    /* SLOW/FAST 使用默认去抖，MODE 使用更快去抖以提高轻按识别率 */
+    debounce_update_ticks(&g_controls.decrease_input, dec_pressed, MODE_DEBOUNCE_TICKS);
+    debounce_update_ticks(&g_controls.increase_input, inc_pressed, MODE_DEBOUNCE_TICKS);
+    debounce_update_ticks(&g_controls.hold_input, hold_pressed, HOLD_DEBOUNCE_TICKS);
 
     /* 基于稳定态计算上升沿，用于唤醒与模式切换判定 */
     static bool s_last_dec = false;
@@ -1491,21 +1613,42 @@ static void controls_update(void)
     bool inc_rise = (!s_last_inc) && inc_now;
     bool hold_rise = (!s_last_hold) && hold_now;
 
-    /* 熄屏下：任意键上升沿立即点亮；中键事件被消耗，其它键不消耗 */
+    /* 原始电平的上升沿检测（不经去抖），作为兜底触发 MODE 切换与诊断 */
+    static bool s_last_hold_raw = false;
+    bool hold_raw_rise = (!s_last_hold_raw) && hold_pressed;
+    s_last_hold_raw = hold_pressed;
+
+    /* 记录稳定态按键掩码变化以便定位键值读取问题（0b SLOW|MODE|FAST）。*/
+    static uint8_t s_last_stable_mask = 0u;
+    uint8_t stable_mask = (dec_now ? 0x1u : 0u) | (hold_now ? 0x2u : 0u) | (inc_now ? 0x4u : 0u);
+    if (stable_mask != s_last_stable_mask) {
+        s_last_stable_mask = stable_mask;
+        emit_log("[key]%u", (unsigned)stable_mask);
+    }
+
+    /* 记录原始电平变化：仅关心 MODE（2）位，便于定位硬件/采样问题 */
+    static uint8_t s_last_raw_mask = 0u;
+    uint8_t raw_mask_now = g_controls_raw_mask;
+    if (raw_mask_now != s_last_raw_mask) {
+        s_last_raw_mask = raw_mask_now;
+        emit_log("[keyr]%u", (unsigned)raw_mask_now);
+    }
+
+    /* 熄屏下：任意键上升沿立即点亮；中键不再吞掉事件，以便可直接切换模式 */
     if (!g_display_awake && (dec_rise || inc_rise || hold_rise)) {
         display_set_awake(true);
         g_display_idle_ms = 0u;
-        if (hold_rise) {
-            /* 吞掉中键的这次上升沿，不进行模式切换 */
-            hold_rise = false;
-        }
     }
 
-    /* 亮屏时，处理中键的模式切换（仅测速完成后允许） */
-    if (hold_rise) {
+    /* 亮屏时，处理中键的模式切换（仅测速完成后允许）；
+     * 除去抖上升沿外，允许原始上升沿兜底触发，避免漏检 */
+    if (hold_rise || hold_raw_rise) {
         if (g_mode != CONTROL_MODE_CALIB) {
+            /* 切换模式：从 AUTO → MANUAL 时，保留当前目标（即 AUTO 的当前值作为手动初始值） */
             g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
             emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
+            /* Persist mode change & latest manual target */
+            persist_save_throttled("mode", 1000u);
         }
     }
 
@@ -1611,16 +1754,41 @@ static int16_t ntc_temp_c_x100_from_adc(uint16_t code)
 }
 
 /* Map temperature (centi-°C) to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
+/* Adjustable AUTO band: default [20,40]°C with a fixed 20°C width, shifted by offset. */
+#define TEMP_BAND_BASE_LOW_CX100     2000
+#define TEMP_BAND_WIDTH_CX100        2000
+#define TEMP_BAND_MIN_CX100          0
+#define TEMP_BAND_MAX_CX100          10000
+#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s */
+
+static int16_t g_temp_band_offset_cx100 = 0;     /* Δ relative to [20,40]°C */
+static int32_t g_temp_band_accum_cx100 = 0;      /* accumulator for fractional steps */
+
+static inline int16_t temp_band_low(void)
+{
+    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + g_temp_band_offset_cx100);
+}
+static inline int16_t temp_band_high(void)
+{
+    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100 + g_temp_band_offset_cx100);
+}
+
 static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
 {
-    if (temp_c_x100 <= 2000) {
+    int16_t lo = temp_band_low();
+    int16_t hi = temp_band_high();
+    if (temp_c_x100 <= lo) {
         return 0;
     }
-    if (temp_c_x100 >= 4000) {
+    if (temp_c_x100 >= hi) {
         return FIX16_ONE;
     }
-    int32_t pos = (int32_t)temp_c_x100 - 2000; /* 0..2000 */
-    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(2000));
+    int32_t span = (int32_t)hi - (int32_t)lo; /* 2000 */
+    if (span <= 0) {
+        return FIX16_ONE;
+    }
+    int32_t pos = (int32_t)temp_c_x100 - (int32_t)lo; /* 0..span */
+    fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(span));
     fix16_t range = FIX16_ONE - g_fan_min_ratio;
     return g_fan_min_ratio + fix16_mul(frac, range);
 }
@@ -1770,12 +1938,33 @@ static void fan_update(uint32_t delta_ms)
         return;
     }
 
-    controls_update();
-
     /* 三模式：测速→温控/手动；MODE只在温控/手动切换 */
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
+        /* Allow band shift while in AUTO using SLOW/FAST */
+        int dir = 0;
+        if (g_controls.decrease_input.stable_state) dir += 1;  /* SLOW → hotter */
+        if (g_controls.increase_input.stable_state) dir -= 1;  /* FAST → colder */
+        if (dir != 0) {
+            int32_t delta = (int32_t)delta_ms * (int32_t)TEMP_BAND_ADJ_RATE_CX100_S * dir;
+            g_temp_band_accum_cx100 += delta;
+            while (g_temp_band_accum_cx100 >= 1000) {
+                g_temp_band_offset_cx100 += 1; /* +1 centi-°C */
+                g_temp_band_accum_cx100 -= 1000;
+            }
+            while (g_temp_band_accum_cx100 <= -1000) {
+                g_temp_band_offset_cx100 -= 1;
+                g_temp_band_accum_cx100 += 1000;
+            }
+            /* Clamp to keep band within [0,100]°C */
+            int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;         /* -2000 */
+            int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100); /* +6000 */
+            if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
+            if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
+            /* Persist occasionally */
+            persist_save_throttled("band", 1000u);
+        }
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
@@ -1790,6 +1979,11 @@ static void fan_update(uint32_t delta_ms)
         g_manual_target = fix16_clamp(g_manual_target, 0, FIX16_ONE);
         if (g_manual_target < g_fan_min_ratio) {
             g_manual_target = g_fan_min_ratio;
+        }
+        /* Persist manual target occasionally when it changes notably */
+        fix16_t diff = fix16_abs(g_manual_target - g_cfg_last_saved_manual);
+        if (diff > (FIX16_ONE / 50)) { /* >2% change */
+            persist_save_throttled("manual", 2000u);
         }
     }
 
@@ -1894,6 +2088,15 @@ static void fan_update(uint32_t delta_ms)
             /* 测速完成后切入温控 */
             g_mode = CONTROL_MODE_TEMP;
             emit_log("[mode]auto");
+            /* Apply restored mode/target if requested */
+            if (g_restore_pending) {
+                if (g_restore_mode == CONTROL_MODE_MANUAL) {
+                    g_manual_target = fix16_clamp(g_restore_manual_target, g_fan_min_ratio, FIX16_ONE);
+                    g_mode = CONTROL_MODE_MANUAL;
+                    emit_log("[mode]manual");
+                }
+                g_restore_pending = false;
+            }
         }
     }
 
@@ -2133,8 +2336,26 @@ int main(void)
     pwm_init();
     tach_init();
     temp_init();
-    ssd1306_i2c_setup();
+    /* Ensure I2C pins (PC1/PC2) are configured to AF-OD before any EEPROM/INA access. */
+    (void)ssd1306_i2c_init();
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
+    Delay_Ms(5);
+#if I2C_DIAG_ENABLE
+    i2c_diag_log_levels("boot");
+#endif
+#if I2C_RECOVER_ENABLE
+    if (!funDigitalRead(PIN_I2C_SDA)) {
+        i2c_bus_recover();
+    }
+#endif
+    /* Quick address probe only when diagnostics are enabled. */
+#if I2C_DIAG_ENABLE
+    emit_log("[i2c]probe,50=%d,3C=%d,40=%d,44=%d",
+             i2c_probe_addr(0x50) ? 1 : 0,
+             i2c_probe_addr(0x3C) ? 1 : 0,
+             i2c_probe_addr(0x40) ? 1 : 0,
+             i2c_probe_addr(0x44) ? 1 : 0);
+#endif
 
     bool font_ready = eeprom_wait_ready(50u);
     if (font_ready) {
@@ -2146,11 +2367,30 @@ int main(void)
     } else {
         emit_log("[ee] no ack");
     }
+    /* Try load persisted control state even if font rows are missing. */
+    eeprom_runtime_cfg_t cfg;
+    if (eeprom_cfg_load(&cfg)) {
+        g_restore_mode = (cfg.last_mode == CFG_MODE_MANUAL) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+        g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
+        /* 将持久化的手动目标同步到运行期的“最近保存”字段，便于随时切入 MANUAL 时恢复 */
+        g_cfg_last_saved_manual = g_restore_manual_target;
+        /* Clamp loaded band offset to allowed range */
+        int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;
+        int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100);
+        int32_t off = cfg.temp_band_offset_cx100;
+        if (off < min_off) off = min_off;
+        if (off > max_off) off = max_off;
+        g_temp_band_offset_cx100 = (int16_t)off;
+        g_restore_pending = true;
+        emit_log("[cfg]ok");
+    } else {
+        emit_log("[cfg]none");
+    }
     if (!font_ready) {
         g_display_error_seen = true;
     }
 
-    (void)WaitForDebuggerToAttach(13);
+    /* Optional: attach debugger wait removed for size. */
 
     emit_log("[boot] start %s", __TIME__);
     power_update();
@@ -2159,7 +2399,7 @@ int main(void)
     fan_calibration_reset();
     emit_log("[mode]init calib");
     ch224_poll(CH224_POLL_INTERVAL_MS);
-    ina226_update(INA226_POLL_INTERVAL_MS);
+    /* Defer INA first contact to the main loop after I2C/display bring-up */
     log_pd_snapshot("boot");
     log_fan_snapshot();
     g_log.have_last = true;
@@ -2187,14 +2427,18 @@ int main(void)
 
         g_uptime_ms += delta_ms;
 
+        /* 先处理按键，保证在任何供电/转态下都能识别 MODE 切换与唤醒 */
+        controls_update();
+
         power_update();
         tach_update(delta_ms);
         ch224_poll(delta_ms);
+        /* Initialize display/I2C early in the loop so the bus is configured for other devices. */
+        display_try_init();
         ina226_update(delta_ms);
         temp_update(delta_ms);
         fan_update(delta_ms);
         poll_input();
-        display_try_init();
         display_idle_update(delta_ms);
         display_render();
         led_update(delta_ms);
@@ -2205,3 +2449,7 @@ int main(void)
         Delay_Ms(LOOP_PERIOD_MS);
     }
 }
+/* Build-time diagnostics toggle (0 reduces flash). */
+#ifndef I2C_DIAG_ENABLE
+#define I2C_DIAG_ENABLE 0
+#endif
