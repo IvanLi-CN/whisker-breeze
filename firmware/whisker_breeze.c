@@ -787,51 +787,31 @@ static void reset_fan_log_timer(void)
 /* Logging helpers                                                            */
 /* -------------------------------------------------------------------------- */
 #ifndef WB_LOG_ENABLE
-#define WB_LOG_ENABLE 0
+#define WB_LOG_ENABLE 1
 #endif
 
 static void emit_log(const char *fmt, ...)
 {
 #if WB_LOG_ENABLE
-    char buffer[160];
-    va_list args;
-    va_start(args, fmt);
-    int written = mini_vsnprintf(buffer, sizeof buffer, fmt, args);
-    va_end(args);
-
-    if (written < 0) {
-        return;
-    }
-
-    if (written >= (int)sizeof buffer) {
-        written = (int)sizeof buffer - 1;
-        buffer[written] = '\0';
-    }
-
-    buffer[written] = '\0';
-
-    char line[200];
-    uint32_t seconds = g_uptime_ms / 1000u;
-    uint32_t millis = g_uptime_ms % 1000u;
-    mini_snprintf(line, sizeof line, "[%05lu.%03lu] %s",
-                  (unsigned long)seconds,
-                  (unsigned long)millis,
-                  buffer);
-
     if (!DidDebuggerAttach()) {
         return;
     }
-
+    uint32_t seconds = g_uptime_ms / 1000u;
+    uint32_t millis = g_uptime_ms % 1000u;
     while (!DebugPrintfBufferFree()) {
         poll_input();
     }
-    printf("%s\r\n", line);
+    printf("[%05lu.%03lu] ", (unsigned long)seconds, (unsigned long)millis);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\r\n");
     while (!DebugPrintfBufferFree()) {
         poll_input();
     }
 #else
     (void)fmt;
-    /* Logs compiled out for size. */
 #endif
 }
 
@@ -1442,7 +1422,8 @@ static void led_update(uint32_t delta_ms)
         uint32_t pct = led_pct_from_duty();
         uint8_t pulses = (uint8_t)((pct * 10u + 99u) / 100u); /* 0..10 -> round up per bin */
         g_led.pulses_target = clamp_u8(pulses == 0 ? 1 : pulses, 1, 10);
-        emit_log("[led]%u", (unsigned)g_led.pulses_target);
+        /* Verbose LED pulse count log can be enabled if needed. */
+        /* emit_log("[led]%u", (unsigned)g_led.pulses_target); */
         led_on();
         return;
     }
@@ -2382,7 +2363,7 @@ int main(void)
         g_display_error_seen = true;
     }
 
-    (void)WaitForDebuggerToAttach(13);
+    /* Optional: attach debugger wait removed for size. */
 
     emit_log("[boot] start %s", __TIME__);
     power_update();
