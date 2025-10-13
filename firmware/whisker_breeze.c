@@ -156,6 +156,40 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 /* 无 */
 
+static void draw_settings_item(const char *label, const char *value, uint8_t y, bool invert_line, bool invert_value)
+{
+    uint8_t x = DISP_ORIGIN_X;
+    size_t l_len = strlen(label);
+    size_t v_len = strlen(value);
+    if (invert_line) {
+        /* Invert entire line: fill then draw inverted text */
+        for (uint8_t yy = 0; yy < 8; ++yy) {
+            for (uint8_t xx = 0; xx < SSD1306_W; ++xx) {
+                ssd1306_drawPixel((uint32_t)x + xx, (uint32_t)y + yy, 1);
+            }
+        }
+        /* Draw full text in color=0 over white background */
+        ssd1306_drawstr(x, y, (char *)label, 0);
+        ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 0);
+    } else {
+        /* Draw label normally */
+        ssd1306_drawstr(x, y, (char *)label, 1);
+        if (invert_value) {
+            /* Fill value area and draw value inverted */
+            uint8_t vx = (uint8_t)(x + (uint8_t)(l_len * 8));
+            uint8_t vw = (uint8_t)((v_len * 8u) > SSD1306_W ? SSD1306_W : (v_len * 8u));
+            for (uint8_t yy = 0; yy < 8; ++yy) {
+                for (uint8_t xx = 0; xx < vw; ++xx) {
+                    ssd1306_drawPixel((uint32_t)vx + xx, (uint32_t)y + yy, 1);
+                }
+            }
+            ssd1306_drawstr(vx, y, (char *)value, 0);
+        } else {
+            ssd1306_drawstr((uint8_t)(x + (uint8_t)(l_len * 8)), y, (char *)value, 1);
+        }
+    }
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Hardware bindings                                                          */
@@ -322,6 +356,10 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 #define CH224_POLL_INTERVAL_MS    50u
 #define DISPLAY_REFRESH_MS         120u   /* Limit OLED updates to reduce flicker */
+
+/* Temperature band absolute limits (centi-°C) for settings */
+#define TEMP_ABS_MIN_CX100          (-2000)
+#define TEMP_ABS_MAX_CX100          (6000)
 
 /* -------------------------------------------------------------------------- */
 /* Type declarations                                                          */
@@ -561,8 +599,20 @@ static fix16_t  g_cfg_last_saved_manual = 0; /* initialized on first save */
 
 /* Forward decls for helpers used before their full definitions */
 static void emit_log(const char *fmt, ...);
+extern uint32_t g_display_sleep_timeout_ms;
 /* Temperature-band offset used by AUTO mapping; full definition appears below. */
 static int16_t g_temp_band_offset_cx100;
+static int16_t g_auto_min_cx100 = 2000; /* 默认 20°C */
+static int16_t g_auto_max_cx100 = 4000; /* 默认 40°C */
+
+/* 设置界面状态 */
+typedef enum {
+    SETTINGS_INACTIVE = 0,
+    SETTINGS_SELECT,
+    SETTINGS_EDIT
+} settings_mode_t;
+static settings_mode_t g_settings_mode = SETTINGS_INACTIVE;
+static uint8_t         g_settings_index = 0; /* 0=min,1=max,2=sleep */
 
 static inline uint16_t ratio_to_q8_8(fix16_t r)
 {
@@ -581,10 +631,16 @@ static void persist_save_now(const char *tag)
 {
     (void)tag;
     eeprom_runtime_cfg_t cfg;
-    cfg.version = 1u;
+    cfg.version = 2u;
     cfg.last_mode = (g_mode == CONTROL_MODE_MANUAL) ? CFG_MODE_MANUAL : CFG_MODE_TEMP;
     cfg.manual_ratio_q8_8 = ratio_to_q8_8(g_manual_target);
     cfg.temp_band_offset_cx100 = g_temp_band_offset_cx100;
+    cfg.auto_min_cx100 = g_auto_min_cx100;
+    cfg.auto_max_cx100 = g_auto_max_cx100;
+    uint32_t sleep_s = g_display_sleep_timeout_ms / 1000u;
+    if (sleep_s < 5u) sleep_s = 5u;
+    if (sleep_s > 60u) sleep_s = 60u;
+    cfg.display_sleep_s = (uint8_t)sleep_s;
     if (eeprom_cfg_save(&cfg)) {
         g_cfg_last_save_ms = g_uptime_ms;
         g_cfg_last_saved_manual = g_manual_target;
@@ -683,12 +739,12 @@ static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
 static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
-/* 屏幕省电：默认亮屏，上电后 30 s 无按键则熄屏；任意按键唤醒。
+/* 屏幕省电：默认亮屏，上电后一段时间无按键则熄屏；任意按键唤醒。
  * - 熄屏下，按中键仅唤醒且消耗该次事件；其它键唤醒且不消耗。
  */
-#define DISPLAY_SLEEP_TIMEOUT_MS 30000u
 static bool     g_display_awake = true;     /* 运行期亮/熄屏状态 */
 static uint32_t g_display_idle_ms = 0u;     /* 距离上次有效输入的空闲时间 */
+uint32_t g_display_sleep_timeout_ms = 30000u; /* 可调 5..60 s */
 /* g_uptime_ms moved above into the time base section */
 
 /* (diagnostic helpers removed to keep minimal behavior) */
@@ -788,7 +844,7 @@ static void reset_fan_log_timer(void)
 /* Logging helpers                                                            */
 /* -------------------------------------------------------------------------- */
 #ifndef WB_LOG_ENABLE
-#define WB_LOG_ENABLE 1
+#define WB_LOG_ENABLE 0
 #endif
 
 static void emit_log(const char *fmt, ...)
@@ -1105,7 +1161,10 @@ static void display_idle_update(uint32_t delta_ms)
             g_display_idle_ms = UINT32_MAX;
     }
 
-    if (g_display_awake && g_display_idle_ms >= DISPLAY_SLEEP_TIMEOUT_MS) {
+    uint32_t timeout = g_display_sleep_timeout_ms;
+    if (timeout < 5000u) timeout = 5000u;
+    if (timeout > 60000u) timeout = 60000u;
+    if (g_display_awake && g_display_idle_ms >= timeout) {
         display_set_awake(false);
     }
 }
@@ -1128,6 +1187,31 @@ static void display_render(void)
 
     char line[12];
     ssd1306_setbuf(0);
+
+    /* 设置界面渲染优先 */
+    if (g_settings_mode != SETTINGS_INACTIVE) {
+        /* Header */
+        snprintf(line, sizeof line, "Settings");
+        ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
+
+        char v0[8], v1[8], v2[8];
+        /* Values: display as integer °C and seconds */
+        int min_c = g_auto_min_cx100 / 100;
+        int max_c = g_auto_max_cx100 / 100;
+        uint32_t sleep_s = g_display_sleep_timeout_ms / 1000u;
+        snprintf(v0, sizeof v0, "%dC", min_c);
+        snprintf(v1, sizeof v1, "%dC", max_c);
+        snprintf(v2, sizeof v2, "%lus", (unsigned long)sleep_s);
+
+        bool editing = (g_settings_mode == SETTINGS_EDIT);
+        /* Line positions: y=8,16,24 */
+        draw_settings_item("MinT ", v0, (uint8_t)(DISP_ORIGIN_Y + 8),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("MaxT ", v1, (uint8_t)(DISP_ORIGIN_Y + 16), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("Sleep ", v2, (uint8_t)(DISP_ORIGIN_Y + 24), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+
+        ssd1306_flush_window();
+        return;
+    }
 
     uint16_t set_pct = percent_from_ratio(g_manual_target);
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
@@ -1640,21 +1724,142 @@ static void controls_update(void)
         g_display_idle_ms = 0u;
     }
 
-    /* 亮屏时，处理中键的模式切换（仅测速完成后允许）；
-     * 除去抖上升沿外，允许原始上升沿兜底触发，避免漏检 */
-    if (hold_rise || hold_raw_rise) {
-        if (g_mode != CONTROL_MODE_CALIB) {
-            /* 切换模式：从 AUTO → MANUAL 时，保留当前目标（即 AUTO 的当前值作为手动初始值） */
-            g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
-            emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
-            /* Persist mode change & latest manual target */
-            persist_save_throttled("mode", 1000u);
-        }
-    }
+    /* MODE 的短按/长按在 ui_update() 中统一处理，这里不再直接切换模式。 */
 
     s_last_dec = dec_now;
     s_last_inc = inc_now;
     s_last_hold = hold_now;
+}
+
+/* -------------------------------------------------------------------------- */
+/* UI state transitions (settings, long/short press)                          */
+/* -------------------------------------------------------------------------- */
+static void ui_update(uint32_t delta_ms)
+{
+    /* Track MODE press duration for long/short discrimination */
+    enum { MODE_LONG_PRESS_MS = 800u };
+    enum { REPEAT_STEP_MS = 200u };
+
+    static uint32_t mode_hold_ms = 0u;
+    static bool     last_hold = false;
+    static bool     prev_dec = false;
+    static bool     prev_inc = false;
+    static uint32_t dec_rep_ms = 0u;
+    static uint32_t inc_rep_ms = 0u;
+
+    bool dec_now = g_controls.decrease_input.stable_state;
+    bool inc_now = g_controls.increase_input.stable_state;
+    bool hold_now = g_controls.hold_input.stable_state;
+
+    /* Long/short event detection on MODE */
+    bool long_evt = false;
+    bool short_evt = false;
+    if (hold_now) {
+        if (mode_hold_ms < UINT32_MAX - delta_ms) mode_hold_ms += delta_ms; else mode_hold_ms = UINT32_MAX;
+    } else if (last_hold) {
+        if (mode_hold_ms >= MODE_LONG_PRESS_MS) {
+            long_evt = true;
+        } else if (mode_hold_ms > 0u) {
+            short_evt = true;
+        }
+        mode_hold_ms = 0u;
+    }
+    last_hold = hold_now;
+
+    if (long_evt) {
+        if (g_settings_mode == SETTINGS_INACTIVE) {
+            g_settings_mode = SETTINGS_SELECT;
+            g_settings_index = 0;
+            g_display_idle_ms = 0u;
+            display_set_awake(true);
+        } else {
+            /* Long press exits settings; ensure we are not stuck in edit mode. */
+            if (g_settings_mode == SETTINGS_EDIT) {
+                g_settings_mode = SETTINGS_SELECT;
+            } else {
+                g_settings_mode = SETTINGS_INACTIVE;
+            }
+            persist_save_now("settings");
+        }
+    } else if (short_evt) {
+        if (g_settings_mode == SETTINGS_INACTIVE) {
+            /* Short press toggles AUTO/MANUAL (if not calibrating). */
+            if (g_mode != CONTROL_MODE_CALIB) {
+                g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+                emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
+                persist_save_throttled("mode", 1000u);
+            }
+        } else {
+            /* In settings: short press toggles select <-> edit */
+            if (g_settings_mode == SETTINGS_SELECT) {
+                g_settings_mode = SETTINGS_EDIT;
+            } else {
+                g_settings_mode = SETTINGS_SELECT;
+                persist_save_throttled("settings", 1000u);
+            }
+        }
+    }
+
+    /* Rising edges for SLOW/FAST */
+    bool dec_rise = (!prev_dec) && dec_now;
+    bool inc_rise = (!prev_inc) && inc_now;
+    prev_dec = dec_now;
+    prev_inc = inc_now;
+
+    /* Selection movement */
+    if (g_settings_mode == SETTINGS_SELECT) {
+        if (dec_rise) {
+            g_settings_index = (uint8_t)((g_settings_index + 3 - 1) % 3);
+        }
+        if (inc_rise) {
+            g_settings_index = (uint8_t)((g_settings_index + 1) % 3);
+        }
+    }
+
+    /* Value editing */
+    if (g_settings_mode == SETTINGS_EDIT) {
+        if (!dec_now) dec_rep_ms = 0u; else { if (dec_rep_ms < UINT32_MAX - delta_ms) dec_rep_ms += delta_ms; else dec_rep_ms = UINT32_MAX; }
+        if (!inc_now) inc_rep_ms = 0u; else { if (inc_rep_ms < UINT32_MAX - delta_ms) inc_rep_ms += delta_ms; else inc_rep_ms = UINT32_MAX; }
+
+        int step_units = 0; /* negative for decrease, positive for increase */
+        if (dec_rise) step_units -= 1;
+        if (inc_rise) step_units += 1;
+        while (dec_rep_ms >= REPEAT_STEP_MS) { step_units -= 1; dec_rep_ms -= REPEAT_STEP_MS; }
+        while (inc_rep_ms >= REPEAT_STEP_MS) { step_units += 1; inc_rep_ms -= REPEAT_STEP_MS; }
+
+        if (step_units != 0) {
+            if (g_settings_index == 0) {
+                int32_t v = (int32_t)g_auto_min_cx100 + (int32_t)step_units * 100;
+                if (v < TEMP_ABS_MIN_CX100) v = TEMP_ABS_MIN_CX100;
+                if (v > TEMP_ABS_MAX_CX100) v = TEMP_ABS_MAX_CX100;
+                g_auto_min_cx100 = (int16_t)v;
+                /* Ensure min < max */
+                if (g_auto_min_cx100 >= g_auto_max_cx100) {
+                    int32_t new_max = (int32_t)g_auto_min_cx100 + 100;
+                    if (new_max > TEMP_ABS_MAX_CX100) new_max = TEMP_ABS_MAX_CX100;
+                    g_auto_max_cx100 = (int16_t)new_max;
+                }
+            } else if (g_settings_index == 1) {
+                int32_t v = (int32_t)g_auto_max_cx100 + (int32_t)step_units * 100;
+                if (v < TEMP_ABS_MIN_CX100) v = TEMP_ABS_MIN_CX100;
+                if (v > TEMP_ABS_MAX_CX100) v = TEMP_ABS_MAX_CX100;
+                g_auto_max_cx100 = (int16_t)v;
+                /* Ensure min < max */
+                if (g_auto_max_cx100 <= g_auto_min_cx100) {
+                    int32_t new_min = (int32_t)g_auto_max_cx100 - 100;
+                    if (new_min < TEMP_ABS_MIN_CX100) new_min = TEMP_ABS_MIN_CX100;
+                    g_auto_min_cx100 = (int16_t)new_min;
+                }
+            } else {
+                int32_t s = (int32_t)(g_display_sleep_timeout_ms / 1000u) + (int32_t)step_units;
+                if (s < 5) s = 5;
+                if (s > 60) s = 60;
+                g_display_sleep_timeout_ms = (uint32_t)s * 1000u;
+            }
+            persist_save_throttled("settings", 1000u);
+            g_display_idle_ms = 0u; /* treat as activity */
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1753,24 +1958,19 @@ static int16_t ntc_temp_c_x100_from_adc(uint16_t code)
     return (int16_t)t;
 }
 
-/* Map temperature (centi-°C) to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
-/* Adjustable AUTO band: default [20,40]°C with a fixed 20°C width, shifted by offset. */
-#define TEMP_BAND_BASE_LOW_CX100     2000
-#define TEMP_BAND_WIDTH_CX100        2000
-#define TEMP_BAND_MIN_CX100          0
-#define TEMP_BAND_MAX_CX100          10000
-#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s */
+/* Map temperature (centi-°C) to target ratio using adjustable band [min,max]. */
+#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s (legacy band offset) */
 
-static int16_t g_temp_band_offset_cx100 = 0;     /* Δ relative to [20,40]°C */
-static int32_t g_temp_band_accum_cx100 = 0;      /* accumulator for fractional steps */
+static int16_t g_temp_band_offset_cx100 = 0;     /* legacy-only; kept for persistence */
+static int32_t g_temp_band_accum_cx100 = 0;      /* legacy accumulator */
 
 static inline int16_t temp_band_low(void)
 {
-    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + g_temp_band_offset_cx100);
+    return g_auto_min_cx100;
 }
 static inline int16_t temp_band_high(void)
 {
-    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100 + g_temp_band_offset_cx100);
+    return g_auto_max_cx100;
 }
 
 static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
@@ -1942,29 +2142,7 @@ static void fan_update(uint32_t delta_ms)
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
-        /* Allow band shift while in AUTO using SLOW/FAST */
-        int dir = 0;
-        if (g_controls.decrease_input.stable_state) dir += 1;  /* SLOW → hotter */
-        if (g_controls.increase_input.stable_state) dir -= 1;  /* FAST → colder */
-        if (dir != 0) {
-            int32_t delta = (int32_t)delta_ms * (int32_t)TEMP_BAND_ADJ_RATE_CX100_S * dir;
-            g_temp_band_accum_cx100 += delta;
-            while (g_temp_band_accum_cx100 >= 1000) {
-                g_temp_band_offset_cx100 += 1; /* +1 centi-°C */
-                g_temp_band_accum_cx100 -= 1000;
-            }
-            while (g_temp_band_accum_cx100 <= -1000) {
-                g_temp_band_offset_cx100 -= 1;
-                g_temp_band_accum_cx100 += 1000;
-            }
-            /* Clamp to keep band within [0,100]°C */
-            int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;         /* -2000 */
-            int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100); /* +6000 */
-            if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
-            if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
-            /* Persist occasionally */
-            persist_save_throttled("band", 1000u);
-        }
+        /* AUTO: map temperature to target using adjustable [min,max] band. */
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
@@ -2374,13 +2552,27 @@ int main(void)
         g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
         /* 将持久化的手动目标同步到运行期的“最近保存”字段，便于随时切入 MANUAL 时恢复 */
         g_cfg_last_saved_manual = g_restore_manual_target;
-        /* Clamp loaded band offset to allowed range */
-        int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;
-        int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100);
-        int32_t off = cfg.temp_band_offset_cx100;
-        if (off < min_off) off = min_off;
-        if (off > max_off) off = max_off;
-        g_temp_band_offset_cx100 = (int16_t)off;
+        /* Legacy offset persisted for compatibility (not used for mapping). */
+        g_temp_band_offset_cx100 = cfg.temp_band_offset_cx100;
+        /* Load adjustable band endpoints and sleep timeout */
+        int32_t min_c = cfg.auto_min_cx100;
+        int32_t max_c = cfg.auto_max_cx100;
+        if (min_c < TEMP_ABS_MIN_CX100) min_c = TEMP_ABS_MIN_CX100;
+        if (min_c > TEMP_ABS_MAX_CX100) min_c = TEMP_ABS_MAX_CX100;
+        if (max_c < TEMP_ABS_MIN_CX100) max_c = TEMP_ABS_MIN_CX100;
+        if (max_c > TEMP_ABS_MAX_CX100) max_c = TEMP_ABS_MAX_CX100;
+        /* ensure sane ordering */
+        if (max_c <= min_c) max_c = min_c + 100;
+        if (max_c > TEMP_ABS_MAX_CX100) {
+            max_c = TEMP_ABS_MAX_CX100;
+            if (min_c >= max_c) min_c = max_c - 100;
+        }
+        g_auto_min_cx100 = (int16_t)min_c;
+        g_auto_max_cx100 = (int16_t)max_c;
+        uint32_t sleep_s = cfg.display_sleep_s;
+        if (sleep_s < 5u) sleep_s = 30u; /* default if unset */
+        if (sleep_s > 60u) sleep_s = 60u;
+        g_display_sleep_timeout_ms = sleep_s * 1000u;
         g_restore_pending = true;
         emit_log("[cfg]ok");
     } else {
@@ -2429,6 +2621,7 @@ int main(void)
 
         /* 先处理按键，保证在任何供电/转态下都能识别 MODE 切换与唤醒 */
         controls_update();
+        ui_update(delta_ms);
 
         power_update();
         tach_update(delta_ms);

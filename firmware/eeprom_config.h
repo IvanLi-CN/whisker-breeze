@@ -1,5 +1,6 @@
 // Minimal EEPROM-backed configuration for Whisker Breeze.
-// Stores last mode, manual target, and optional temp-band offset.
+// Stores last mode, manual target, AUTO band endpoints, display sleep timeout,
+// and a legacy temp-band offset for backward compatibility.
 
 #ifndef EEPROM_CONFIG_H
 #define EEPROM_CONFIG_H
@@ -17,7 +18,10 @@ typedef struct {
     uint8_t   version;                  // 0x01
     cfg_mode_t last_mode;               // TEMP or MANUAL
     uint16_t  manual_ratio_q8_8;        // 0..256 (1.00 -> 256)
-    int16_t   temp_band_offset_cx100;   // centi-°C offset relative to [20,40]°C
+    int16_t   temp_band_offset_cx100;   // centi-°C offset relative to [20,40]°C (legacy)
+    int16_t   auto_min_cx100;           // centi-°C, -2000..6000
+    int16_t   auto_max_cx100;           // centi-°C, -2000..6000
+    uint8_t   display_sleep_s;          // 5..60 seconds
 } eeprom_runtime_cfg_t;
 
 // Load the persisted configuration if valid; returns true on success.
@@ -27,4 +31,3 @@ bool eeprom_cfg_load(eeprom_runtime_cfg_t *out);
 bool eeprom_cfg_save(const eeprom_runtime_cfg_t *in);
 
 #endif // EEPROM_CONFIG_H
-
