@@ -1198,9 +1198,7 @@ static void display_render(void)
 
     /* 设置界面渲染优先 */
     if (g_settings_mode != SETTINGS_INACTIVE) {
-        /* Header */
-        snprintf(line, sizeof line, "Settings");
-        ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
+        /* (No header to save flash) */
 
         char v0[8], v1[8], v2[8];
         /* Values: display as integer °C and seconds */
@@ -1213,9 +1211,9 @@ static void display_render(void)
 
         bool editing = (g_settings_mode == SETTINGS_EDIT);
         /* Line positions: y=8,16,24 */
-        draw_settings_item("MinT ", v0, (uint8_t)(DISP_ORIGIN_Y + 8),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
-        draw_settings_item("MaxT ", v1, (uint8_t)(DISP_ORIGIN_Y + 16), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
-        draw_settings_item("Sleep ", v2, (uint8_t)(DISP_ORIGIN_Y + 24), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+        draw_settings_item("Lo ", v0, (uint8_t)(DISP_ORIGIN_Y + 8),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("Hi ", v1, (uint8_t)(DISP_ORIGIN_Y + 16), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("Slp ", v2, (uint8_t)(DISP_ORIGIN_Y + 24), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
 
         ssd1306_flush_window();
         return;
@@ -1715,7 +1713,9 @@ static void controls_update(void)
     uint8_t stable_mask = (dec_now ? 0x1u : 0u) | (hold_now ? 0x2u : 0u) | (inc_now ? 0x4u : 0u);
     if (stable_mask != s_last_stable_mask) {
         s_last_stable_mask = stable_mask;
+#if WB_LOG_ENABLE
         emit_log("[key]%u", (unsigned)stable_mask);
+#endif
     }
 
     /* 记录原始电平变化：仅关心 MODE（2）位，便于定位硬件/采样问题 */
@@ -1723,7 +1723,9 @@ static void controls_update(void)
     uint8_t raw_mask_now = g_controls_raw_mask;
     if (raw_mask_now != s_last_raw_mask) {
         s_last_raw_mask = raw_mask_now;
+#if WB_LOG_ENABLE
         emit_log("[keyr]%u", (unsigned)raw_mask_now);
+#endif
     }
 
     /* 熄屏下：任意键上升沿立即点亮；中键不再吞掉事件，以便可直接切换模式 */
@@ -1750,6 +1752,7 @@ static void ui_update(uint32_t delta_ms)
 
     static uint32_t mode_hold_ms = 0u;
     static bool     last_hold = false;
+    static bool     mode_long_fired = false; /* fire long event immediately upon threshold */
     static bool     prev_dec = false;
     static bool     prev_inc = false;
     static uint32_t dec_rep_ms = 0u;
@@ -1764,13 +1767,16 @@ static void ui_update(uint32_t delta_ms)
     bool short_evt = false;
     if (hold_now) {
         if (mode_hold_ms < UINT32_MAX - delta_ms) mode_hold_ms += delta_ms; else mode_hold_ms = UINT32_MAX;
+        if (!mode_long_fired && mode_hold_ms >= MODE_LONG_PRESS_MS) {
+            long_evt = true;          /* fire immediately on threshold */
+            mode_long_fired = true;   /* suppress short on release */
+        }
     } else if (last_hold) {
-        if (mode_hold_ms >= MODE_LONG_PRESS_MS) {
-            long_evt = true;
-        } else if (mode_hold_ms > 0u) {
-            short_evt = true;
+        if (!mode_long_fired && mode_hold_ms > 0u) {
+            short_evt = true;         /* short only if no long was fired */
         }
         mode_hold_ms = 0u;
+        mode_long_fired = false;
     }
     last_hold = hold_now;
 
@@ -1780,30 +1786,38 @@ static void ui_update(uint32_t delta_ms)
             g_settings_index = 0;
             g_display_idle_ms = 0u;
             display_set_awake(true);
+            /* Reset nav edge tracking to avoid stale edges */
+            prev_dec = g_controls.decrease_input.stable_state;
+            prev_inc = g_controls.increase_input.stable_state;
         } else {
-            /* Long press exits settings; ensure we are not stuck in edit mode. */
-            if (g_settings_mode == SETTINGS_EDIT) {
-                g_settings_mode = SETTINGS_SELECT;
-            } else {
-                g_settings_mode = SETTINGS_INACTIVE;
-            }
+            /* Long press exits settings immediately from any substate. */
+            g_settings_mode = SETTINGS_INACTIVE;
             persist_save_now("settings");
+            /* Clear nav state */
+            prev_dec = g_controls.decrease_input.stable_state;
+            prev_inc = g_controls.increase_input.stable_state;
         }
     } else if (short_evt) {
         if (g_settings_mode == SETTINGS_INACTIVE) {
             /* Short press toggles AUTO/MANUAL (if not calibrating). */
             if (g_mode != CONTROL_MODE_CALIB) {
                 g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
-                emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
                 persist_save_throttled("mode", 1000u);
             }
         } else {
             /* In settings: short press toggles select <-> edit */
             if (g_settings_mode == SETTINGS_SELECT) {
                 g_settings_mode = SETTINGS_EDIT;
+                /* Reset repeat timers and nav edges to avoid accidental moves */
+                dec_rep_ms = inc_rep_ms = 0u;
+                prev_dec = g_controls.decrease_input.stable_state;
+                prev_inc = g_controls.increase_input.stable_state;
             } else {
                 g_settings_mode = SETTINGS_SELECT;
                 persist_save_throttled("settings", 1000u);
+                /* Reset edges */
+                prev_dec = g_controls.decrease_input.stable_state;
+                prev_inc = g_controls.increase_input.stable_state;
             }
         }
     }
