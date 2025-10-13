@@ -1741,7 +1741,7 @@ static void ui_update(uint32_t delta_ms)
 {
     /* Track MODE press duration for long/short discrimination */
     enum { MODE_LONG_PRESS_MS = 800u };
-    enum { REPEAT_STEP_MS = 200u };
+    /* No repeat while editing values to ensure precise 1°C/1s steps */
 
     static uint32_t mode_hold_ms = 0u;
     static bool     last_hold = false;
@@ -1801,8 +1801,7 @@ static void ui_update(uint32_t delta_ms)
             /* In settings: short press toggles select <-> edit */
             if (g_settings_mode == SETTINGS_SELECT) {
                 g_settings_mode = SETTINGS_EDIT;
-                /* Reset repeat timers and nav edges to avoid accidental moves */
-                dec_rep_ms = inc_rep_ms = 0u;
+                /* Reset nav edges to avoid accidental moves */
                 prev_dec = g_controls.decrease_input.stable_state;
                 prev_inc = g_controls.increase_input.stable_state;
             } else {
@@ -1833,14 +1832,9 @@ static void ui_update(uint32_t delta_ms)
 
     /* Value editing */
     if (g_settings_mode == SETTINGS_EDIT) {
-        if (!dec_now) dec_rep_ms = 0u; else { if (dec_rep_ms < UINT32_MAX - delta_ms) dec_rep_ms += delta_ms; else dec_rep_ms = UINT32_MAX; }
-        if (!inc_now) inc_rep_ms = 0u; else { if (inc_rep_ms < UINT32_MAX - delta_ms) inc_rep_ms += delta_ms; else inc_rep_ms = UINT32_MAX; }
-
         int step_units = 0; /* negative for decrease, positive for increase */
         if (dec_rise) step_units -= 1;
         if (inc_rise) step_units += 1;
-        while (dec_rep_ms >= REPEAT_STEP_MS) { step_units -= 1; dec_rep_ms -= REPEAT_STEP_MS; }
-        while (inc_rep_ms >= REPEAT_STEP_MS) { step_units += 1; inc_rep_ms -= REPEAT_STEP_MS; }
 
         if (step_units != 0) {
             if (g_settings_index == 0) {
