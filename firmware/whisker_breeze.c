@@ -1213,9 +1213,9 @@ static void display_render(void)
 
         bool editing = (g_settings_mode == SETTINGS_EDIT);
         /* Line positions with extra line-height: y=6,18,30 */
-        draw_settings_item("L", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
-        draw_settings_item("H", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
-        draw_settings_item("S", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+        draw_settings_item("Min ", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("Max ", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("Sleep ", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
 
         ssd1306_flush_window();
         return;
@@ -1225,19 +1225,19 @@ static void display_render(void)
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
     uint32_t rpm_now = (g_fan.rpm_smooth != 0u) ? g_fan.rpm_smooth : g_fan.rpm;
 
-    snprintf(line, sizeof line, "S%3u", (unsigned)set_pct);
+    snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
 
-    snprintf(line, sizeof line, "O%3u", (unsigned)out_pct);
+    snprintf(line, sizeof line, "Out %3u%%", (unsigned)out_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 8, line, 1);
 
-    snprintf(line, sizeof line, "R%4lu", (unsigned long)rpm_now);
+    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
 
     /* 第四行：显示控制模式（不加标签）。AUTO/Manual/Calib */
-    if (g_mode == CONTROL_MODE_TEMP) { snprintf(line, sizeof line, "A"); }
-    else if (g_mode == CONTROL_MODE_MANUAL) { snprintf(line, sizeof line, "M"); }
-    else { snprintf(line, sizeof line, "C"); }
+    if (g_mode == CONTROL_MODE_TEMP) { snprintf(line, sizeof line, "Auto"); }
+    else if (g_mode == CONTROL_MODE_MANUAL) { snprintf(line, sizeof line, "Manual"); }
+    else { snprintf(line, sizeof line, "Calib"); }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
     /* 第五行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
@@ -1247,15 +1247,17 @@ static void display_render(void)
         if (mv < 0) mv = 0; /* Clamp to 0 for display */
         if (ma < 0) ma = 0;
         long v_int = (long)(mv / 1000);
+        long v_dec1 = (long)((mv % 1000 + 50) / 100); /* round to 0.1V */
+        if (v_dec1 >= 10) { v_int += 1; v_dec1 -= 10; }
         long ma_int = (long)ma; /* already rounded to 1 mA in INA driver */
         if (ma_int < 0) ma_int = 0;
         if (ma_int > 9999) ma_int = 9999; /* clamp to fit width */
-        /* Compact: Vxx mA */
-        snprintf(line, sizeof line, "V%ld %ld",
-                 v_int, ma_int);
+        /* e.g. "12.3V 450mA" -> fits within 12 chars */
+        snprintf(line, sizeof line, "%ld.%ldV %ldmA",
+                 v_int, v_dec1, ma_int);
     } else {
-        /* 传感器无效时显示空值 */
-        snprintf(line, sizeof line, "--.- ----");
+        /* 传感器无效时显示空值，不加任何标签 */
+        snprintf(line, sizeof line, "--.-V ----mA");
     }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
 
