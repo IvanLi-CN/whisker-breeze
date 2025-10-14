@@ -156,6 +156,72 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 /* 无 */
 
+static inline void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h)
+{
+    uint8_t y2 = (uint8_t)(y + h);
+    uint8_t x2 = (uint8_t)(x + w);
+    for (uint8_t yy = y; yy < y2; ++yy) {
+        for (uint8_t xx = x; xx < x2; ++xx) {
+            ssd1306_drawPixel((uint32_t)xx, (uint32_t)yy, 1);
+        }
+    }
+}
+
+static void draw_settings_item(const char *label, const char *value, uint8_t y, bool invert_line, bool invert_value)
+{
+    /* Two-column layout: col0=labels (left), col1=values (right) */
+    /* Column widths: 66% (labels), 34% (values) */
+    const uint8_t col0_w = (uint8_t)(((uint16_t)SSD1306_W * 66u) / 100u);
+    const uint8_t col1_w = (uint8_t)(SSD1306_W - col0_w);
+    const uint8_t x_label = DISP_ORIGIN_X;
+    const uint8_t x_value = (uint8_t)(DISP_ORIGIN_X + col0_w);
+    size_t v_len = strlen(value);
+    /* add vertical padding ±1px around 8px font for better readability */
+    uint8_t y_pad = (y > 0) ? (uint8_t)(y - 1) : 0;
+    uint8_t line_h = 10; /* 8px font + 2px padding */
+    if (invert_line) {
+        /* Invert entire line area with padding */
+        fill_rect(DISP_ORIGIN_X, y_pad, SSD1306_W, line_h);
+        /* Draw full text in color=0 over white background */
+        ssd1306_drawstr(x_label, y, (char *)label, 0);
+        ssd1306_drawstr(x_value, y, (char *)value, 0);
+    } else {
+        /* Draw label normally */
+        ssd1306_drawstr(x_label, y, (char *)label, 1);
+        if (invert_value) {
+            /* Fill value area with padding and draw value inverted */
+            uint8_t vx = x_value;
+            uint8_t vw = (uint8_t)((v_len * 8u) > col1_w ? col1_w : (v_len * 8u));
+            fill_rect(vx, y_pad, vw, line_h);
+            ssd1306_drawstr(vx, y, (char *)value, 0);
+        } else {
+            ssd1306_drawstr(x_value, y, (char *)value, 1);
+        }
+    }
+}
+
+/* Generic auto-repeat helper: returns number of extra steps (>=0) to apply.
+ * state: 0=idle, 1=initial (waiting), 2=repeat */
+static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, uint8_t *state,
+                           uint16_t initial_ms, uint16_t interval_ms)
+{
+    int8_t steps = 0;
+    if (pressed) {
+        if (*state == 0u) {
+            *state = 1u; *hold_ms = 0u; steps = 1; /* first tap */
+        } else if (*state == 1u) {
+            uint32_t t = *hold_ms + delta_ms;
+            if (t >= initial_ms) { *state = 2u; *hold_ms = t - initial_ms; }
+            else { *hold_ms = t; }
+        } else {
+            uint32_t t = *hold_ms + delta_ms;
+            while (t >= interval_ms) { steps++; t -= interval_ms; }
+            *hold_ms = t;
+        }
+    } else { *state = 0u; *hold_ms = 0u; }
+    return steps;
+}
+
 
 /* -------------------------------------------------------------------------- */
 /* Hardware bindings                                                          */
@@ -304,7 +370,7 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 #define LOG_MIN_INTERVAL_MS       250u
 #endif
 
-#define MODE_DEBOUNCE_TICKS       3u   /* default for SLOW/FAST */
+#define MODE_DEBOUNCE_TICKS       2u   /* faster response for SLOW/FAST */
 #define HOLD_DEBOUNCE_TICKS       1u   /* MODE尽量灵敏，轻按也能触发 */
 #define LOOP_PERIOD_MS            10u
 
@@ -322,6 +388,10 @@ int mini_snprintf(char *buffer, unsigned int buffer_len, const char *fmt, ...);
 
 #define CH224_POLL_INTERVAL_MS    50u
 #define DISPLAY_REFRESH_MS         120u   /* Limit OLED updates to reduce flicker */
+
+/* Temperature band absolute limits (centi-°C) for settings */
+#define TEMP_ABS_MIN_CX100          (-2000)
+#define TEMP_ABS_MAX_CX100          (6000)
 
 /* -------------------------------------------------------------------------- */
 /* Type declarations                                                          */
@@ -561,8 +631,29 @@ static fix16_t  g_cfg_last_saved_manual = 0; /* initialized on first save */
 
 /* Forward decls for helpers used before their full definitions */
 static void emit_log(const char *fmt, ...);
+extern uint32_t g_display_sleep_timeout_ms;
 /* Temperature-band offset used by AUTO mapping; full definition appears below. */
 static int16_t g_temp_band_offset_cx100;
+static int32_t g_temp_band_accum_cx100; /* legacy accumulator; defined later */
+static int16_t g_auto_min_cx100 = 2000; /* 默认 20°C */
+static int16_t g_auto_max_cx100 = 4000; /* 默认 40°C */
+
+/* 设置界面状态 */
+typedef enum {
+    SETTINGS_INACTIVE = 0,
+    SETTINGS_SELECT,
+    SETTINGS_EDIT
+} settings_mode_t;
+static settings_mode_t g_settings_mode = SETTINGS_INACTIVE;
+static uint8_t         g_settings_index = 0; /* 0=min,1=max,2=sleep */
+
+__attribute__((noinline)) static void clamp_offset_to_band(void)
+{
+    int32_t min_off = (int32_t)TEMP_ABS_MIN_CX100 - (int32_t)g_auto_min_cx100;
+    int32_t max_off = (int32_t)TEMP_ABS_MAX_CX100 - (int32_t)g_auto_max_cx100;
+    if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
+    if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
+}
 
 static inline uint16_t ratio_to_q8_8(fix16_t r)
 {
@@ -581,14 +672,23 @@ static void persist_save_now(const char *tag)
 {
     (void)tag;
     eeprom_runtime_cfg_t cfg;
-    cfg.version = 1u;
+    cfg.version = 2u;
     cfg.last_mode = (g_mode == CONTROL_MODE_MANUAL) ? CFG_MODE_MANUAL : CFG_MODE_TEMP;
     cfg.manual_ratio_q8_8 = ratio_to_q8_8(g_manual_target);
     cfg.temp_band_offset_cx100 = g_temp_band_offset_cx100;
+    cfg.auto_min_cx100 = g_auto_min_cx100;
+    cfg.auto_max_cx100 = g_auto_max_cx100;
+    uint32_t sleep_s = g_display_sleep_timeout_ms / 1000u;
+    if (sleep_s < 5u) sleep_s = 5u;
+    if (sleep_s > 60u) sleep_s = 60u;
+    cfg.display_sleep_s = (uint8_t)sleep_s;
     if (eeprom_cfg_save(&cfg)) {
         g_cfg_last_save_ms = g_uptime_ms;
         g_cfg_last_saved_manual = g_manual_target;
+        
+#if WB_LOG_ENABLE
         emit_log("[cfg]save");
+#endif
     }
 }
 
@@ -683,12 +783,12 @@ static bool g_display_initialized = false;
 static bool g_display_probe_attempted = false;
 static bool g_display_unavailable = false;
 static bool g_display_disabled_logged = false;
-/* 屏幕省电：默认亮屏，上电后 30 s 无按键则熄屏；任意按键唤醒。
+/* 屏幕省电：默认亮屏，上电后一段时间无按键则熄屏；任意按键唤醒。
  * - 熄屏下，按中键仅唤醒且消耗该次事件；其它键唤醒且不消耗。
  */
-#define DISPLAY_SLEEP_TIMEOUT_MS 30000u
 static bool     g_display_awake = true;     /* 运行期亮/熄屏状态 */
 static uint32_t g_display_idle_ms = 0u;     /* 距离上次有效输入的空闲时间 */
+uint32_t g_display_sleep_timeout_ms = 30000u; /* 可调 5..60 s */
 /* g_uptime_ms moved above into the time base section */
 
 /* (diagnostic helpers removed to keep minimal behavior) */
@@ -788,7 +888,7 @@ static void reset_fan_log_timer(void)
 /* Logging helpers                                                            */
 /* -------------------------------------------------------------------------- */
 #ifndef WB_LOG_ENABLE
-#define WB_LOG_ENABLE 1
+#define WB_LOG_ENABLE 0
 #endif
 
 static void emit_log(const char *fmt, ...)
@@ -879,7 +979,10 @@ static void ina226_report_error(const char *stage)
     uint32_t now = g_uptime_ms;
     if (g_ina.last_error_report_ms == 0u ||
         (now - g_ina.last_error_report_ms) >= INA226_ERROR_LOG_INTERVAL_MS) {
+        
+#if WB_LOG_ENABLE
         emit_log("[ina]%s,%02X", stage, (unsigned)g_ina.address);
+#endif
         g_ina.last_error_report_ms = (now == 0u) ? 1u : now;
     }
 }
@@ -918,7 +1021,10 @@ static void ina226_update(uint32_t delta_ms)
             ina226_report_error("configure");
             /* Attempt the other strap address exactly once. */
             if (g_ina.address == 0x40u) {
+                
+#if WB_LOG_ENABLE
                 emit_log("[ina]try,44");
+#endif
                 g_ina.address = 0x44u;
                 if (!ina226_configure()) {
                     g_ina.fault = true;
@@ -926,7 +1032,10 @@ static void ina226_update(uint32_t delta_ms)
                     return;
                 }
             } else {
+                
+#if WB_LOG_ENABLE
                 emit_log("[ina]try,40");
+#endif
                 g_ina.address = 0x40u;
                 if (!ina226_configure()) {
                     g_ina.fault = true;
@@ -1018,7 +1127,10 @@ static void ina226_update(uint32_t delta_ms)
     if (!g_ina.online_announced) {
         long bus_whole = bus_mv / 1000;
         long bus_frac = bus_mv % 1000;
+        
+#if WB_LOG_ENABLE
         emit_log("[ina]%ld.%03ldV", bus_whole, bus_frac);
+#endif
         g_ina.online_announced = true;
         g_ina.last_error_report_ms = 0u;
     }
@@ -1046,11 +1158,7 @@ static bool debounce_update_ticks(debounce_t *db, bool raw_level, uint8_t ticks)
     return false;
 }
 
-/* 兼容旧调用，默认使用 MODE_DEBOUNCE_TICKS */
-static bool debounce_update(debounce_t *db, bool raw_level)
-{
-    return debounce_update_ticks(db, raw_level, MODE_DEBOUNCE_TICKS);
-}
+/* （移除旧的兼容包装，节省空间） */
 
 /* -------------------------------------------------------------------------- */
 /* Display helpers                                                            */
@@ -1105,7 +1213,10 @@ static void display_idle_update(uint32_t delta_ms)
             g_display_idle_ms = UINT32_MAX;
     }
 
-    if (g_display_awake && g_display_idle_ms >= DISPLAY_SLEEP_TIMEOUT_MS) {
+    uint32_t timeout = g_display_sleep_timeout_ms;
+    if (timeout < 5000u) timeout = 5000u;
+    if (timeout > 60000u) timeout = 60000u;
+    if (g_display_awake && g_display_idle_ms >= timeout) {
         display_set_awake(false);
     }
 }
@@ -1129,6 +1240,29 @@ static void display_render(void)
     char line[12];
     ssd1306_setbuf(0);
 
+    /* 设置界面渲染优先 */
+    if (g_settings_mode != SETTINGS_INACTIVE) {
+        /* (No header to save flash) */
+
+        char v0[8], v1[8], v2[8];
+        /* Values: display as integer °C and seconds */
+        int min_c = g_auto_min_cx100 / 100;
+        int max_c = g_auto_max_cx100 / 100;
+        uint32_t sleep_s = g_display_sleep_timeout_ms / 1000u;
+        snprintf(v0, sizeof v0, "%d", min_c);
+        snprintf(v1, sizeof v1, "%d", max_c);
+        snprintf(v2, sizeof v2, "%lu", (unsigned long)sleep_s);
+
+        bool editing = (g_settings_mode == SETTINGS_EDIT);
+        /* Line positions with extra line-height: y=6,18,30 */
+        draw_settings_item("Min", v0, (uint8_t)(DISP_ORIGIN_Y + 6),  (!editing && g_settings_index == 0), ( editing && g_settings_index == 0));
+        draw_settings_item("Max", v1, (uint8_t)(DISP_ORIGIN_Y + 18), (!editing && g_settings_index == 1), ( editing && g_settings_index == 1));
+        draw_settings_item("Sleep", v2, (uint8_t)(DISP_ORIGIN_Y + 30), (!editing && g_settings_index == 2), ( editing && g_settings_index == 2));
+
+        ssd1306_flush_window();
+        return;
+    }
+
     uint16_t set_pct = percent_from_ratio(g_manual_target);
     uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
     uint32_t rpm_now = (g_fan.rpm_smooth != 0u) ? g_fan.rpm_smooth : g_fan.rpm;
@@ -1143,13 +1277,9 @@ static void display_render(void)
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
 
     /* 第四行：显示控制模式（不加标签）。AUTO/Manual/Calib */
-    if (g_mode == CONTROL_MODE_TEMP) {
-        snprintf(line, sizeof line, "Auto");
-    } else if (g_mode == CONTROL_MODE_MANUAL) {
-        snprintf(line, sizeof line, "Manual");
-    } else {
-        snprintf(line, sizeof line, "Calib");
-    }
+    if (g_mode == CONTROL_MODE_TEMP) { snprintf(line, sizeof line, "Auto"); }
+    else if (g_mode == CONTROL_MODE_MANUAL) { snprintf(line, sizeof line, "Manual"); }
+    else { snprintf(line, sizeof line, "Calib"); }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
     /* 第五行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
@@ -1159,14 +1289,12 @@ static void display_render(void)
         if (mv < 0) mv = 0; /* Clamp to 0 for display */
         if (ma < 0) ma = 0;
         long v_int = (long)(mv / 1000);
-        long v_dec1 = (long)((mv % 1000 + 50) / 100); /* round to 0.1V */
-        if (v_dec1 >= 10) { v_int += 1; v_dec1 -= 10; }
         long ma_int = (long)ma; /* already rounded to 1 mA in INA driver */
         if (ma_int < 0) ma_int = 0;
         if (ma_int > 9999) ma_int = 9999; /* clamp to fit width */
-        /* e.g. "12.3V 450mA" -> fits within 12 chars */
-        snprintf(line, sizeof line, "%ld.%ldV %ldmA",
-                 v_int, v_dec1, ma_int);
+        /* Compact: integer volts to save space */
+        snprintf(line, sizeof line, "V%ld %ldmA",
+                 v_int, ma_int);
     } else {
         /* 传感器无效时显示空值，不加任何标签 */
         snprintf(line, sizeof line, "--.-V ----mA");
@@ -1187,14 +1315,18 @@ static void display_try_init(void)
 
     if (g_display_unavailable) {
         if (!g_display_disabled_logged) {
+#if WB_LOG_ENABLE
             emit_log("[disp] skip (disabled)");
+#endif
             g_display_disabled_logged = true;
         }
         return;
     }
 
     if (!g_display_probe_attempted) {
+#if WB_LOG_ENABLE
         emit_log("[disp] probe");
+#endif
     }
 
     g_display_probe_attempted = true;
@@ -1213,7 +1345,9 @@ static void display_try_init(void)
             ssd1306_setbuf(0);
             g_display_initialized = true;
             g_display_disabled_logged = false;
+#if WB_LOG_ENABLE
             emit_log("[disp]ok");
+#endif
             /* IMPORTANT: ssd1306_i2c_init() forces I2C1 to ~1MHz. Restore shared bus speed. */
             i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
 
@@ -1231,9 +1365,13 @@ static void display_try_init(void)
     display_power(false);
     g_display_disabled_logged = true;
     if (g_display_error_seen) {
+#if WB_LOG_ENABLE
         emit_log("[disp] timeout");
+#endif
     } else {
+#if WB_LOG_ENABLE
         emit_log("[disp] missing");
+#endif
     }
     /* Restore (or enforce) I2C speed even on failure. */
     i2c1_configure_speed(I2C1_SHARED_BUS_TARGET_HZ);
@@ -1613,17 +1751,14 @@ static void controls_update(void)
     bool inc_rise = (!s_last_inc) && inc_now;
     bool hold_rise = (!s_last_hold) && hold_now;
 
-    /* 原始电平的上升沿检测（不经去抖），作为兜底触发 MODE 切换与诊断 */
-    static bool s_last_hold_raw = false;
-    bool hold_raw_rise = (!s_last_hold_raw) && hold_pressed;
-    s_last_hold_raw = hold_pressed;
-
     /* 记录稳定态按键掩码变化以便定位键值读取问题（0b SLOW|MODE|FAST）。*/
     static uint8_t s_last_stable_mask = 0u;
     uint8_t stable_mask = (dec_now ? 0x1u : 0u) | (hold_now ? 0x2u : 0u) | (inc_now ? 0x4u : 0u);
     if (stable_mask != s_last_stable_mask) {
         s_last_stable_mask = stable_mask;
+#if WB_LOG_ENABLE
         emit_log("[key]%u", (unsigned)stable_mask);
+#endif
     }
 
     /* 记录原始电平变化：仅关心 MODE（2）位，便于定位硬件/采样问题 */
@@ -1631,7 +1766,9 @@ static void controls_update(void)
     uint8_t raw_mask_now = g_controls_raw_mask;
     if (raw_mask_now != s_last_raw_mask) {
         s_last_raw_mask = raw_mask_now;
+#if WB_LOG_ENABLE
         emit_log("[keyr]%u", (unsigned)raw_mask_now);
+#endif
     }
 
     /* 熄屏下：任意键上升沿立即点亮；中键不再吞掉事件，以便可直接切换模式 */
@@ -1640,21 +1777,184 @@ static void controls_update(void)
         g_display_idle_ms = 0u;
     }
 
-    /* 亮屏时，处理中键的模式切换（仅测速完成后允许）；
-     * 除去抖上升沿外，允许原始上升沿兜底触发，避免漏检 */
-    if (hold_rise || hold_raw_rise) {
-        if (g_mode != CONTROL_MODE_CALIB) {
-            /* 切换模式：从 AUTO → MANUAL 时，保留当前目标（即 AUTO 的当前值作为手动初始值） */
-            g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
-            emit_log("[mode]%s", (g_mode == CONTROL_MODE_TEMP) ? "auto" : "manual");
-            /* Persist mode change & latest manual target */
-            persist_save_throttled("mode", 1000u);
-        }
-    }
+    /* MODE 的短按/长按在 ui_update() 中统一处理，这里不再直接切换模式。 */
 
     s_last_dec = dec_now;
     s_last_inc = inc_now;
     s_last_hold = hold_now;
+}
+
+/* -------------------------------------------------------------------------- */
+/* UI state transitions (settings, long/short press)                          */
+/* -------------------------------------------------------------------------- */
+static void ui_update(uint32_t delta_ms)
+{
+    /* Track MODE press duration for long/short discrimination */
+    enum { MODE_LONG_PRESS_MS = 800u };
+    /* No repeat while editing values to ensure precise 1°C/1s steps */
+
+    static uint32_t mode_hold_ms = 0u;
+    static bool     last_hold = false;
+    static bool     mode_long_fired = false; /* fire long event immediately upon threshold */
+    static bool     prev_dec = false;
+    static bool     prev_inc = false;
+
+    bool dec_now = g_controls.decrease_input.stable_state;
+    bool inc_now = g_controls.increase_input.stable_state;
+    bool hold_now = g_controls.hold_input.stable_state;
+
+    /* Long/short event detection on MODE */
+    bool long_evt = false;
+    bool short_evt = false;
+    if (hold_now) {
+        if (mode_hold_ms < UINT32_MAX - delta_ms) mode_hold_ms += delta_ms; else mode_hold_ms = UINT32_MAX;
+        if (!mode_long_fired && mode_hold_ms >= MODE_LONG_PRESS_MS) {
+            long_evt = true;          /* fire immediately on threshold */
+            mode_long_fired = true;   /* suppress short on release */
+        }
+    } else if (last_hold) {
+        if (!mode_long_fired && mode_hold_ms > 0u) {
+            short_evt = true;         /* short only if no long was fired */
+        }
+        mode_hold_ms = 0u;
+        mode_long_fired = false;
+    }
+    last_hold = hold_now;
+
+    if (long_evt) {
+        if (g_settings_mode == SETTINGS_INACTIVE) {
+            /* Fold current AUTO offset into absolute min/max so Settings shows the
+             * effective band. Then reset runtime offset to zero. */
+            if (g_temp_band_offset_cx100 != 0) {
+                int32_t new_min = (int32_t)g_auto_min_cx100 + (int32_t)g_temp_band_offset_cx100;
+                int32_t new_max = (int32_t)g_auto_max_cx100 + (int32_t)g_temp_band_offset_cx100;
+                /* Clamp to absolute bounds */
+                if (new_min < TEMP_ABS_MIN_CX100) new_min = TEMP_ABS_MIN_CX100;
+                if (new_min > TEMP_ABS_MAX_CX100) new_min = TEMP_ABS_MAX_CX100;
+                if (new_max < TEMP_ABS_MIN_CX100) new_max = TEMP_ABS_MIN_CX100;
+                if (new_max > TEMP_ABS_MAX_CX100) new_max = TEMP_ABS_MAX_CX100;
+                /* Ensure ordering and at least 1°C span */
+                if (new_max <= new_min) new_max = new_min + 100;
+                if (new_max > TEMP_ABS_MAX_CX100) {
+                    new_max = TEMP_ABS_MAX_CX100;
+                    if (new_min >= new_max) new_min = new_max - 100;
+                }
+                g_auto_min_cx100 = (int16_t)new_min;
+                g_auto_max_cx100 = (int16_t)new_max;
+                /* Reset legacy/runtime offset and its accumulator */
+                g_temp_band_offset_cx100 = 0;
+                g_temp_band_accum_cx100 = 0;
+                /* No immediate save required; leaving Settings will persist. */
+            }
+            g_settings_mode = SETTINGS_SELECT;
+            g_settings_index = 0;
+            g_display_idle_ms = 0u;
+            display_set_awake(true);
+            /* Reset nav edge tracking to avoid stale edges */
+            prev_dec = g_controls.decrease_input.stable_state;
+            prev_inc = g_controls.increase_input.stable_state;
+        } else {
+            /* Long press exits settings immediately from any substate. */
+            g_settings_mode = SETTINGS_INACTIVE;
+            persist_save_now("settings");
+            /* Clear nav state */
+            prev_dec = g_controls.decrease_input.stable_state;
+            prev_inc = g_controls.increase_input.stable_state;
+        }
+    } else if (short_evt) {
+        if (g_settings_mode == SETTINGS_INACTIVE) {
+            /* Short press toggles AUTO/MANUAL (if not calibrating). */
+            if (g_mode != CONTROL_MODE_CALIB) {
+                g_mode = (g_mode == CONTROL_MODE_TEMP) ? CONTROL_MODE_MANUAL : CONTROL_MODE_TEMP;
+                persist_save_throttled("mode", 1000u);
+            }
+        } else {
+            /* In settings: short press toggles select <-> edit */
+            if (g_settings_mode == SETTINGS_SELECT) {
+                g_settings_mode = SETTINGS_EDIT;
+                /* Reset nav edges to avoid accidental moves */
+                prev_dec = g_controls.decrease_input.stable_state;
+                prev_inc = g_controls.increase_input.stable_state;
+            } else {
+                g_settings_mode = SETTINGS_SELECT;
+                persist_save_throttled("settings", 1000u);
+                /* Reset edges */
+                prev_dec = g_controls.decrease_input.stable_state;
+                prev_inc = g_controls.increase_input.stable_state;
+            }
+        }
+    }
+
+    /* Rising edges for SLOW/FAST (debounced only; no multi-step on hold) */
+    bool dec_rise = (!prev_dec) && dec_now;
+    bool inc_rise = (!prev_inc) && inc_now;
+    prev_dec = dec_now;
+    prev_inc = inc_now;
+
+    /* Selection movement */
+    if (g_settings_mode == SETTINGS_SELECT) {
+        if (dec_rise) {
+            g_settings_index = (uint8_t)((g_settings_index + 3 - 1) % 3);
+        }
+        if (inc_rise) {
+            g_settings_index = (uint8_t)((g_settings_index + 1) % 3);
+        }
+    }
+
+    /* Value editing */
+    if (g_settings_mode == SETTINGS_EDIT) {
+        enum { EDIT_REPEAT_INITIAL_MS = 250u, EDIT_REPEAT_INTERVAL_MS = 120u };
+        static uint32_t dec_hold_ms = 0u, inc_hold_ms = 0u;
+        static uint8_t  dec_state = 0u,  inc_state = 0u;
+
+        int step_units = 0; /* negative for decrease, positive for increase */
+        /* first tap/hold managed by helper */
+        int8_t add_dec = repeat_steps(g_controls.decrease_input.stable_state, delta_ms,
+                                       &dec_hold_ms, &dec_state,
+                                       EDIT_REPEAT_INITIAL_MS, EDIT_REPEAT_INTERVAL_MS);
+        int8_t add_inc = repeat_steps(g_controls.increase_input.stable_state, delta_ms,
+                                       &inc_hold_ms, &inc_state,
+                                       EDIT_REPEAT_INITIAL_MS, EDIT_REPEAT_INTERVAL_MS);
+        step_units += (int)add_inc;
+        step_units -= (int)add_dec;
+
+        if (step_units != 0) {
+            if (g_settings_index == 0) {
+                int32_t v = (int32_t)g_auto_min_cx100 + (int32_t)step_units * 100;
+                if (v < TEMP_ABS_MIN_CX100) v = TEMP_ABS_MIN_CX100;
+                if (v > TEMP_ABS_MAX_CX100) v = TEMP_ABS_MAX_CX100;
+                g_auto_min_cx100 = (int16_t)v;
+                /* Ensure min < max */
+                if (g_auto_min_cx100 >= g_auto_max_cx100) {
+                    int32_t new_max = (int32_t)g_auto_min_cx100 + 100;
+                    if (new_max > TEMP_ABS_MAX_CX100) new_max = TEMP_ABS_MAX_CX100;
+                    g_auto_max_cx100 = (int16_t)new_max;
+                }
+                /* Clamp offset to new band limits */
+                clamp_offset_to_band();
+            } else if (g_settings_index == 1) {
+                int32_t v = (int32_t)g_auto_max_cx100 + (int32_t)step_units * 100;
+                if (v < TEMP_ABS_MIN_CX100) v = TEMP_ABS_MIN_CX100;
+                if (v > TEMP_ABS_MAX_CX100) v = TEMP_ABS_MAX_CX100;
+                g_auto_max_cx100 = (int16_t)v;
+                /* Ensure min < max */
+                if (g_auto_max_cx100 <= g_auto_min_cx100) {
+                    int32_t new_min = (int32_t)g_auto_max_cx100 - 100;
+                    if (new_min < TEMP_ABS_MIN_CX100) new_min = TEMP_ABS_MIN_CX100;
+                    g_auto_min_cx100 = (int16_t)new_min;
+                }
+                /* Clamp offset to new band limits */
+                clamp_offset_to_band();
+            } else {
+                int32_t s = (int32_t)(g_display_sleep_timeout_ms / 1000u) + (int32_t)step_units;
+                if (s < 5) s = 5;
+                if (s > 60) s = 60;
+                g_display_sleep_timeout_ms = (uint32_t)s * 1000u;
+            }
+            persist_save_throttled("settings", 1000u);
+            g_display_idle_ms = 0u; /* treat as activity */
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1753,24 +2053,19 @@ static int16_t ntc_temp_c_x100_from_adc(uint16_t code)
     return (int16_t)t;
 }
 
-/* Map temperature (centi-°C) to target ratio: <20°C => 0, 20–40°C => min..1, >=40°C => 1 */
-/* Adjustable AUTO band: default [20,40]°C with a fixed 20°C width, shifted by offset. */
-#define TEMP_BAND_BASE_LOW_CX100     2000
-#define TEMP_BAND_WIDTH_CX100        2000
-#define TEMP_BAND_MIN_CX100          0
-#define TEMP_BAND_MAX_CX100          10000
-#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s */
+/* Map temperature (centi-°C) to target ratio using adjustable band [min,max]. */
+#define TEMP_BAND_ADJ_RATE_CX100_S   50    /* 0.5 °C/s (legacy band offset) */
 
-static int16_t g_temp_band_offset_cx100 = 0;     /* Δ relative to [20,40]°C */
-static int32_t g_temp_band_accum_cx100 = 0;      /* accumulator for fractional steps */
+static int16_t g_temp_band_offset_cx100 = 0;     /* legacy-only; kept for persistence */
+static int32_t g_temp_band_accum_cx100 = 0;      /* legacy accumulator */
 
 static inline int16_t temp_band_low(void)
 {
-    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + g_temp_band_offset_cx100);
+    return (int16_t)(g_auto_min_cx100 + g_temp_band_offset_cx100);
 }
 static inline int16_t temp_band_high(void)
 {
-    return (int16_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100 + g_temp_band_offset_cx100);
+    return (int16_t)(g_auto_max_cx100 + g_temp_band_offset_cx100);
 }
 
 static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
@@ -1942,7 +2237,7 @@ static void fan_update(uint32_t delta_ms)
     if (g_mode == CONTROL_MODE_CALIB) {
         g_manual_target = FIX16_ONE; /* 全速测峰值 */
     } else if (g_mode == CONTROL_MODE_TEMP) {
-        /* Allow band shift while in AUTO using SLOW/FAST */
+        /* AUTO: allow HOT/COLD shift using SLOW/FAST to offset the configured [min,max]. */
         int dir = 0;
         if (g_controls.decrease_input.stable_state) dir += 1;  /* SLOW → hotter */
         if (g_controls.increase_input.stable_state) dir -= 1;  /* FAST → colder */
@@ -1957,28 +2252,37 @@ static void fan_update(uint32_t delta_ms)
                 g_temp_band_offset_cx100 -= 1;
                 g_temp_band_accum_cx100 += 1000;
             }
-            /* Clamp to keep band within [0,100]°C */
-            int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;         /* -2000 */
-            int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100); /* +6000 */
-            if (g_temp_band_offset_cx100 < (int16_t)min_off) g_temp_band_offset_cx100 = (int16_t)min_off;
-            if (g_temp_band_offset_cx100 > (int16_t)max_off) g_temp_band_offset_cx100 = (int16_t)max_off;
+            /* Clamp offset so that shifted [min,max] stays within absolute bounds. */
+            clamp_offset_to_band();
             /* Persist occasionally */
             persist_save_throttled("band", 1000u);
         }
+        /* AUTO map temp against (min+offset, max+offset) */
         fix16_t auto_target = temp_target_ratio_from_temp(g_temp.temp_c_x100);
         g_manual_target = fix16_clamp(auto_target, 0, FIX16_ONE);
     } else {
-        /* 手动：按键调整 */
-        fix16_t adjust = (fix16_t)((int64_t)FAN_ADJUST_RATE_PER_MS_Q16 * delta_ms);
-        if (g_controls.decrease_input.stable_state) {
-            g_manual_target -= adjust;
-        }
-        if (g_controls.increase_input.stable_state) {
-            g_manual_target += adjust;
-        }
-        g_manual_target = fix16_clamp(g_manual_target, 0, FIX16_ONE);
-        if (g_manual_target < g_fan_min_ratio) {
-            g_manual_target = g_fan_min_ratio;
+        /* 手动：1% 步进，支持连发（初始延时+重复节拍），更稳定好控 */
+        const fix16_t MANUAL_STEP_Q16 = (FIX16_ONE / 100); /* 1% */
+        enum { MAN_REPEAT_INITIAL_MS = 250u, MAN_REPEAT_INTERVAL_MS = 120u };
+        static uint32_t man_dec_ms = 0u, man_inc_ms = 0u;
+        static uint8_t  man_dec_state = 0u, man_inc_state = 0u;
+
+        int step = 0;
+        int8_t add_dec = repeat_steps(g_controls.decrease_input.stable_state, delta_ms,
+                                       &man_dec_ms, &man_dec_state,
+                                       MAN_REPEAT_INITIAL_MS, MAN_REPEAT_INTERVAL_MS);
+        int8_t add_inc = repeat_steps(g_controls.increase_input.stable_state, delta_ms,
+                                       &man_inc_ms, &man_inc_state,
+                                       MAN_REPEAT_INITIAL_MS, MAN_REPEAT_INTERVAL_MS);
+        step += (int)add_inc;
+        step -= (int)add_dec;
+
+        if (step != 0) {
+            fix16_t delta = (fix16_t)((int64_t)MANUAL_STEP_Q16 * step);
+            g_manual_target = fix16_clamp(g_manual_target + delta, 0, FIX16_ONE);
+            if (g_manual_target < g_fan_min_ratio) {
+                g_manual_target = g_fan_min_ratio;
+            }
         }
         /* Persist manual target occasionally when it changes notably */
         fix16_t diff = fix16_abs(g_manual_target - g_cfg_last_saved_manual);
@@ -2358,14 +2662,18 @@ int main(void)
 #endif
 
     bool font_ready = eeprom_wait_ready(50u);
-    if (font_ready) {
+        if (font_ready) {
         uint8_t probe_rows[8];
         if (!font_storage_fetch_rows('0', probe_rows)) {
+#if WB_LOG_ENABLE
             emit_log("[ee] font missing");
+#endif
             font_ready = false;
         }
     } else {
+#if WB_LOG_ENABLE
         emit_log("[ee] no ack");
+#endif
     }
     /* Try load persisted control state even if font rows are missing. */
     eeprom_runtime_cfg_t cfg;
@@ -2374,17 +2682,38 @@ int main(void)
         g_restore_manual_target = q8_8_to_ratio(cfg.manual_ratio_q8_8);
         /* 将持久化的手动目标同步到运行期的“最近保存”字段，便于随时切入 MANUAL 时恢复 */
         g_cfg_last_saved_manual = g_restore_manual_target;
-        /* Clamp loaded band offset to allowed range */
-        int32_t min_off = (int32_t)TEMP_BAND_MIN_CX100 - (int32_t)TEMP_BAND_BASE_LOW_CX100;
-        int32_t max_off = (int32_t)TEMP_BAND_MAX_CX100 - (int32_t)(TEMP_BAND_BASE_LOW_CX100 + TEMP_BAND_WIDTH_CX100);
-        int32_t off = cfg.temp_band_offset_cx100;
-        if (off < min_off) off = min_off;
-        if (off > max_off) off = max_off;
-        g_temp_band_offset_cx100 = (int16_t)off;
+        /* Legacy offset persisted for compatibility (now used as shift on configured band). */
+        g_temp_band_offset_cx100 = cfg.temp_band_offset_cx100;
+        /* Load adjustable band endpoints and sleep timeout */
+        int32_t min_c = cfg.auto_min_cx100;
+        int32_t max_c = cfg.auto_max_cx100;
+        if (min_c < TEMP_ABS_MIN_CX100) min_c = TEMP_ABS_MIN_CX100;
+        if (min_c > TEMP_ABS_MAX_CX100) min_c = TEMP_ABS_MAX_CX100;
+        if (max_c < TEMP_ABS_MIN_CX100) max_c = TEMP_ABS_MIN_CX100;
+        if (max_c > TEMP_ABS_MAX_CX100) max_c = TEMP_ABS_MAX_CX100;
+        /* ensure sane ordering */
+        if (max_c <= min_c) max_c = min_c + 100;
+        if (max_c > TEMP_ABS_MAX_CX100) {
+            max_c = TEMP_ABS_MAX_CX100;
+            if (min_c >= max_c) min_c = max_c - 100;
+        }
+        g_auto_min_cx100 = (int16_t)min_c;
+        g_auto_max_cx100 = (int16_t)max_c;
+        /* Clamp offset to new band limits */
+        clamp_offset_to_band();
+        uint32_t sleep_s = cfg.display_sleep_s;
+        if (sleep_s < 5u) sleep_s = 30u; /* default if unset */
+        if (sleep_s > 60u) sleep_s = 60u;
+        g_display_sleep_timeout_ms = sleep_s * 1000u;
         g_restore_pending = true;
+#if WB_LOG_ENABLE
         emit_log("[cfg]ok");
+#endif
     } else {
+        
+#if WB_LOG_ENABLE
         emit_log("[cfg]none");
+#endif
     }
     if (!font_ready) {
         g_display_error_seen = true;
@@ -2392,7 +2721,10 @@ int main(void)
 
     /* Optional: attach debugger wait removed for size. */
 
+    
+#if WB_LOG_ENABLE
     emit_log("[boot] start %s", __TIME__);
+#endif
     power_update();
     /* 上电先进入测速模式 */
     g_mode = CONTROL_MODE_CALIB;
@@ -2405,7 +2737,7 @@ int main(void)
     g_log.have_last = true;
     reset_fan_log_timer();
 
-    printf("Whisker Breeze controller ready\r\n");
+    /* startup banner removed to save flash */
 
     /* Seed SysTick-based timekeeping. */
     g_systick_last = SysTick->CNT;
@@ -2429,6 +2761,7 @@ int main(void)
 
         /* 先处理按键，保证在任何供电/转态下都能识别 MODE 切换与唤醒 */
         controls_update();
+        ui_update(delta_ms);
 
         power_update();
         tach_update(delta_ms);
