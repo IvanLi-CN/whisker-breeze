@@ -1264,25 +1264,56 @@ static void display_render(void)
     }
 
     uint16_t set_pct = percent_from_ratio(g_manual_target);
-    uint16_t out_pct = percent_from_ratio(g_fan.current_duty);
     uint32_t rpm_now = (g_fan.rpm_smooth != 0u) ? g_fan.rpm_smooth : g_fan.rpm;
 
+    /* 第一行：目标百分比（Set） */
     snprintf(line, sizeof line, "Set %3u%%", (unsigned)set_pct);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
 
-    snprintf(line, sizeof line, "Out %3u%%", (unsigned)out_pct);
+    /* 第二行：转速 RPM */
+    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 8, line, 1);
 
-    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
-    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
+    /* 第三行：显示控制模式，最右侧对齐显示当前温度（整数部分） */
+    {
+        char mode[8];
+        if (g_mode == CONTROL_MODE_TEMP) {
+            snprintf(mode, sizeof mode, "Auto");
+        } else if (g_mode == CONTROL_MODE_MANUAL) {
+            snprintf(mode, sizeof mode, "Manual");
+        } else {
+            snprintf(mode, sizeof mode, "Calib");
+        }
+        int temp_i = g_temp.temp_c_x100 / 100; /* 仅整数部分 */
+        if (temp_i < 0) temp_i = 0; /* 显示不为负 */
 
-    /* 第四行：显示控制模式（不加标签）。AUTO/Manual/Calib */
-    if (g_mode == CONTROL_MODE_TEMP) { snprintf(line, sizeof line, "Auto"); }
-    else if (g_mode == CONTROL_MODE_MANUAL) { snprintf(line, sizeof line, "Manual"); }
-    else { snprintf(line, sizeof line, "Calib"); }
-    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
+        char tbuf[6];
+        snprintf(tbuf, sizeof tbuf, "%d", temp_i);
 
-    /* 第五行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
+        /* 右对齐到一行可视宽度（72px/8px=9字符） */
+        const int total = 9;
+        int mlen = (int)strnlen(mode, sizeof mode);
+        int tlen = (int)strnlen(tbuf, sizeof tbuf);
+        int spaces = total - mlen - tlen;
+        if (spaces < 0) spaces = 0; /* 空间不足时紧贴显示 */
+
+        /* 构造形如："Manual   26" */
+        int written = 0;
+        written = snprintf(line, sizeof line, "%s", mode);
+        if (written < 0) written = 0;
+        int pos = written;
+        while (spaces-- > 0 && pos < (int)sizeof(line) - 1) {
+            line[pos++] = ' ';
+        }
+        /* 追加温度字符串（可能因长度受限被截断） */
+        for (int i = 0; i < tlen && pos < (int)sizeof(line) - 1; ++i) {
+            line[pos++] = tbuf[i];
+        }
+        line[pos] = '\0';
+        ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 16, line, 1);
+    }
+
+    /* 第四行：显示电压电流（无标签）。格式固定为 "xx.xV yyyymA"，总长<=12。 */
     if (g_ina.valid) {
         int32_t mv = g_ina.bus_voltage_mv;
         int32_t ma = g_ina.current_ma;
@@ -1299,7 +1330,7 @@ static void display_render(void)
         /* 传感器无效时显示空值，不加任何标签 */
         snprintf(line, sizeof line, "--.-V ----mA");
     }
-    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 32, line, 1);
+    ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 24, line, 1);
 
     ssd1306_flush_window();
 }
