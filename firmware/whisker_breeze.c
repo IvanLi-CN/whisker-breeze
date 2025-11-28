@@ -2310,10 +2310,9 @@ static void fan_update(uint32_t delta_ms)
 
         if (step != 0) {
             fix16_t delta = (fix16_t)((int64_t)MANUAL_STEP_Q16 * step);
+            /* Manual mode: allow full 0–100% range without enforcing a minimum
+             * ratio floor; 0% means fan fully off. */
             g_manual_target = fix16_clamp(g_manual_target + delta, 0, FIX16_ONE);
-            if (g_manual_target < g_fan_min_ratio) {
-                g_manual_target = g_fan_min_ratio;
-            }
         }
         /* Persist manual target occasionally when it changes notably */
         fix16_t diff = fix16_abs(g_manual_target - g_cfg_last_saved_manual);
@@ -2323,8 +2322,18 @@ static void fan_update(uint32_t delta_ms)
     }
 
     fix16_t ratio = g_manual_target;
-    fix16_t duty_span = FAN_PWM_MAX_DUTY_Q16 - FAN_PWM_MIN_DUTY_Q16;
-    fix16_t duty_target = FAN_PWM_MIN_DUTY_Q16 + fix16_mul(ratio, duty_span);
+    fix16_t duty_target;
+
+    /* When the logical target is 0%, drive the PWM duty to 0 so the fan
+     * power switch can be turned fully off. For any non-zero ratio we still
+     * map into the calibrated [min,max] duty window. */
+    if (ratio <= 0) {
+        duty_target = 0;
+    } else {
+        fix16_t duty_span = FAN_PWM_MAX_DUTY_Q16 - FAN_PWM_MIN_DUTY_Q16;
+        duty_target = FAN_PWM_MIN_DUTY_Q16 + fix16_mul(ratio, duty_span);
+    }
+
     g_fan.target_duty = duty_target;
 
     if (g_fan.rpm_valid) {
@@ -2405,15 +2414,10 @@ static void fan_update(uint32_t delta_ms)
 
             g_fan_min_ratio = fix16_clamp(ratio_100rpm, FAN_DEFAULT_MIN_RATIO_Q16, FIX16_ONE);
 
-            fix16_t target_ratio = ratio_100rpm;
-            if (target_ratio < FAN_PWM_MIN_DUTY_Q16) {
-                target_ratio = FAN_PWM_MIN_DUTY_Q16;
-            }
-            if (target_ratio < g_fan_min_ratio) {
-                target_ratio = g_fan_min_ratio;
-            }
-
-            g_manual_target = fix16_clamp(target_ratio, 0, FIX16_ONE);
+            /* Recommended manual target after calibration is the 100 RPM
+             * equivalent ratio itself; manual mode is free to go all the way
+             * down to 0% if the user desires. */
+            g_manual_target = fix16_clamp(ratio_100rpm, 0, FIX16_ONE);
             g_fan_calibration.active = false;
             g_fan_calibration.completed = true;
             emit_log("[cal]%u/%u",
@@ -2426,7 +2430,9 @@ static void fan_update(uint32_t delta_ms)
             /* Apply restored mode/target if requested */
             if (g_restore_pending) {
                 if (g_restore_mode == CONTROL_MODE_MANUAL) {
-                    g_manual_target = fix16_clamp(g_restore_manual_target, g_fan_min_ratio, FIX16_ONE);
+                    /* Restore the exact saved manual percentage (0–100%),
+                     * without forcing a minimum ratio floor. */
+                    g_manual_target = fix16_clamp(g_restore_manual_target, 0, FIX16_ONE);
                     g_mode = CONTROL_MODE_MANUAL;
                     emit_log("[mode]manual");
                 }
