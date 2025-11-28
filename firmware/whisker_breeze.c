@@ -274,7 +274,8 @@ static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, u
 #define FAN_PWM_MAX_DUTY_Q16          (FIX16_ONE)
 #define FAN_PWM_RAMP_STEP_Q16         (FIX16_ONE / 50)         /* 0.02 */
 #define FAN_ADJUST_RATE_PER_MS_Q16    (FIX16_ONE / 2000)       /* 0.0005 */
-#define FAN_SOFT_START_MS             100u
+#define FAN_SPINUP_MS                 100u
+#define FAN_SPINUP_DUTY_Q16           (FIX16_ONE / 5)          /* 0.20 */
 #define FAN_TACH_TIMEOUT_MS           500u
 #define FAN_TACH_TIMER_PRESCALER      479u      /* 48 MHz / (479+1) = 100 kHz */
 #define FAN_TACH_TIMER_CLOCK_HZ       (48000000u / (FAN_TACH_TIMER_PRESCALER + 1u))
@@ -408,7 +409,7 @@ typedef struct {
 } controls_state_t;
 
 typedef enum {
-    FAN_PHASE_SOFT_START = 0,
+    FAN_PHASE_SPINUP = 0,
     FAN_PHASE_RUN
 } fan_phase_t;
 
@@ -420,7 +421,7 @@ typedef struct {
     uint32_t rpm_smooth;
     uint32_t rpm_max;
     bool rpm_valid;
-    uint32_t soft_timer_ms;
+    uint32_t spinup_timer_ms;
     bool power_enabled;
     uint32_t power_settle_ms;
 } fan_state_t;
@@ -525,14 +526,14 @@ static uint32_t g_systick_rem_ticks = 0;
 static fix16_t g_manual_target = FIX16_ONE;
 
 static fan_state_t g_fan = {
-    .phase = FAN_PHASE_SOFT_START,
+    .phase = FAN_PHASE_SPINUP,
     .target_duty = 0,
     .current_duty = 0,
     .rpm = 0u,
     .rpm_smooth = 0u,
     .rpm_max = 0u,
     .rpm_valid = false,
-    .soft_timer_ms = 0,
+    .spinup_timer_ms = 0,
     .power_enabled = false,
     .power_settle_ms = 0,
 };
@@ -584,7 +585,7 @@ static log_state_t g_log = {
     .sample_accum = 0,
     .since_last_log = 1000,
     .have_last = false,
-    .last_phase = FAN_PHASE_SOFT_START,
+    .last_phase = FAN_PHASE_SPINUP,
     .last_target = 0,
     .last_duty = 0,
     .last_rpm = 0u,
@@ -2257,8 +2258,8 @@ static void fan_update(uint32_t delta_ms)
 {
     if (!g_power.vbus_valid) {
         fan_apply_pwm(0, delta_ms);
-        g_fan.phase = FAN_PHASE_SOFT_START;
-        g_fan.soft_timer_ms = 0;
+        g_fan.phase = FAN_PHASE_SPINUP;
+        g_fan.spinup_timer_ms = 0;
         g_fan.rpm_max = 0u;
         g_fan.rpm_valid = false;
         return;
@@ -2346,18 +2347,19 @@ static void fan_update(uint32_t delta_ms)
         g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO_Q16;
     }
 
-    if (g_fan.phase == FAN_PHASE_SOFT_START) {
-        g_fan.soft_timer_ms += delta_ms;
-        fix16_t progress = (g_fan.soft_timer_ms >= FAN_SOFT_START_MS)
-                               ? FIX16_ONE
-                               : fix16_div(fix16_from_int((int32_t)g_fan.soft_timer_ms),
-                                            fix16_from_int((int32_t)FAN_SOFT_START_MS));
-        fix16_t start_level = FAN_PWM_MAX_DUTY_Q16;
-        fix16_t duty_delta = duty_target - start_level;
-        fix16_t duty = start_level + fix16_mul(duty_delta, progress);
-        fan_apply_pwm(duty, delta_ms);
+    if (g_fan.phase == FAN_PHASE_SPINUP) {
+        g_fan.spinup_timer_ms += delta_ms;
 
-        if (g_fan.soft_timer_ms >= FAN_SOFT_START_MS) {
+        /* Spin-up boost phase: for a short window after enabling the fan,
+         * drive a modest fixed duty to help overcome static friction.
+         * A logical 0% target still results in the fan being kept off. */
+        if (duty_target <= 0) {
+            fan_apply_pwm(0, delta_ms);
+        } else {
+            fan_apply_pwm(FAN_SPINUP_DUTY_Q16, delta_ms);
+        }
+
+        if (g_fan.spinup_timer_ms >= FAN_SPINUP_MS) {
             g_fan.phase = FAN_PHASE_RUN;
         }
     } else {
@@ -2465,8 +2467,8 @@ static void power_update(void)
         /* Only on falling edge do we reset fan state and stability tracking. */
         if (prev_vbus) {
             fan_apply_pwm(0, 0u);
-            g_fan.phase = FAN_PHASE_SOFT_START;
-            g_fan.soft_timer_ms = 0;
+            g_fan.phase = FAN_PHASE_SPINUP;
+            g_fan.spinup_timer_ms = 0;
             g_fan.rpm_max = 0u;
             g_fan.rpm_valid = false;
             fan_calibration_reset();

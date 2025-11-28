@@ -125,7 +125,7 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
   - `drivers.adc`: Provides channel polling scaffolding (currently disabled pending thermal sensing enablement).
   - `drivers.uart`: Maintains optional UART logging and command interface (compile-time disabled).
   - `app.modes`: Translates SLOW/MODE/FAST inputs into normalized setpoints with interpolated smoothing.
-  - `app.fan`: Executes soft-start, duty-cycle regulation, RPM computation via EXTI4/TIM2, and fault handling (RPM stalls, outliers).
+  - `app.fan`: Executes spin-up boost, duty-cycle regulation, RPM computation via EXTI4/TIM2, and fault handling (RPM stalls, outliers).
   - `app.power`: Monitors VBUS_PG, aggregates INA226 telemetry, and publishes power-state information to the heartbeat log.
 - **Logging**: UART logging remains disabled. When enabled, the heartbeat includes: `p` (phase), `t` (target %), `d` (duty %), `r` (RPM), `v` (VBUS presence flag), `12` (12 V status), `b` (INA226 bus register raw), `i` (current in mA), `c` (TIM1 CH3 compare value), `k` (debounced switch state).
 - **Calibration**: On power-up, firmware performs a full-speed calibration after confirming `12 = 1`. After ≥2 s of stable operation (500 ms without RPM increase), it logs `[cal]rpm/tgt` and reverts to the greater of 10% duty or 100 RPM equivalent. Loss of PD or VBUS resets calibration.
@@ -133,7 +133,7 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 ## Operating Parameters
 
 - PWM frequency: 20 kHz nominal (acceptable range 20–30 kHz).
-- Soft-start: linear ramp from 0% to target over 0–100 ms after FAN_EN assertion.
+- Spin-up boost: after `FAN_EN` is asserted, the controller drives a fixed ~20% PWM duty for up to 100 ms to help the fan overcome static friction before handing off to normal duty control.
 - ADC sampling: infrastructure reserved; intended 200 ms cadence when thermal sensing is enabled.
 - UART baud rate: unused.
 - Mode input polarity: active low; confirm pull-ups enabled on PD2/PD3/PD4.
