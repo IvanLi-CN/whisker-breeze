@@ -272,7 +272,7 @@ static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, u
 #define FAN_PWM_PERIOD_TICKS          2400u      /* 48 MHz / 20 kHz */
 #define FAN_PWM_MIN_DUTY_Q16          (FIX16_ONE / 10)         /* 0.10 */
 #define FAN_PWM_MAX_DUTY_Q16          (FIX16_ONE)
-#define FAN_PWM_RAMP_STEP_Q16         (FIX16_ONE / 50)         /* 0.02 */
+#define FAN_PWM_RAMP_STEP_Q16         (FIX16_ONE / 100)        /* 0.01 */
 #define FAN_ADJUST_RATE_PER_MS_Q16    (FIX16_ONE / 2000)       /* 0.0005 */
 #define FAN_SPINUP_MS                 100u
 #define FAN_SPINUP_DUTY_Q16           (FIX16_ONE / 5)          /* 0.20 */
@@ -285,7 +285,6 @@ static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, u
 #define FAN_POWER_ON_DELAY_MS         1u
 #define FAN_DEFAULT_MIN_RPM           100u
 #define FAN_DEFAULT_MAX_RPM           20000u
-#define FAN_DEFAULT_MIN_RATIO_Q16     ((fix16_t)((((uint64_t)FAN_DEFAULT_MIN_RPM) << FIX16_FRAC_BITS) / (FAN_DEFAULT_MAX_RPM)))
 #define FAN_RPM_GLITCH_MIN_BASE       300u
 #define FAN_RPM_GLITCH_UPPER_RPM      16000u   /* ignore only absurd spikes, not real 10k RPM */
 
@@ -417,6 +416,7 @@ typedef struct {
     fan_phase_t phase;
     fix16_t target_duty;
     fix16_t current_duty;
+    uint32_t target_rpm;
     uint32_t rpm;
     uint32_t rpm_smooth;
     uint32_t rpm_max;
@@ -502,6 +502,14 @@ typedef struct {
     uint32_t start_ms;
 } fan_calibration_state_t;
 
+typedef struct {
+    int32_t kp_q16;
+    int32_t ki_q16;
+    int32_t kd_q16;
+    int32_t integrator_q16;
+    int32_t last_err_q16;
+} fan_pid_t;
+
 /* -------------------------------------------------------------------------- */
 /* Module state                                                               */
 /* -------------------------------------------------------------------------- */
@@ -529,6 +537,7 @@ static fan_state_t g_fan = {
     .phase = FAN_PHASE_SPINUP,
     .target_duty = 0,
     .current_duty = 0,
+    .target_rpm = 0u,
     .rpm = 0u,
     .rpm_smooth = 0u,
     .rpm_max = 0u,
@@ -537,8 +546,6 @@ static fan_state_t g_fan = {
     .power_enabled = false,
     .power_settle_ms = 0,
 };
-
-static fix16_t g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO_Q16;
 
 static power_state_t g_power = {
     .vbus_valid = false,
@@ -581,6 +588,11 @@ static tach_state_t g_tach = {
     .good_period_ticks = 0,
 };
 
+/* Tach presence: set to true once a plausible tach period has been observed
+ * after startup. Never cleared afterwards; runtime glitches or temporary
+ * stall are reflected via rpm==0 rather than by toggling this flag. */
+static bool g_tach_present = false;
+
 static log_state_t g_log = {
     .sample_accum = 0,
     .since_last_log = 1000,
@@ -603,6 +615,17 @@ static fan_calibration_state_t g_fan_calibration = {
     .peak_rpm = 0u,
     .last_improve_ms = 0u,
     .start_ms = 0u,
+};
+
+static fan_pid_t g_fan_pid = {
+    /* Tunable PID gains in Q16 format. Use a very gentle integral-only
+     * controller on RPM ratio error; no proportional/derivative term.
+     * The integrator acts directly on duty command. */
+    .kp_q16 = 0,
+    .ki_q16 = (int32_t)(FIX16_ONE / 80),   /* ≈0.0125 per update on full error */
+    .kd_q16 = 0,
+    .integrator_q16 = 0,
+    .last_err_q16 = 0,
 };
 
 static temp_state_t g_temp = {
@@ -1272,7 +1295,11 @@ static void display_render(void)
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 0, line, 1);
 
     /* 第二行：转速 RPM */
-    snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
+    if (!g_tach_present) {
+        snprintf(line, sizeof line, "RPM --");
+    } else {
+        snprintf(line, sizeof line, "RPM %4lu", (unsigned long)rpm_now);
+    }
     ssd1306_drawstr(DISP_ORIGIN_X, DISP_ORIGIN_Y + 8, line, 1);
 
     /* 第三行：显示控制模式，最右侧对齐显示当前温度（整数部分） */
@@ -1470,14 +1497,21 @@ static void pwm_set_duty(fix16_t duty)
     TIM1->CH3CVR = (uint16_t)compare;
 }
 
+static void fan_power_off(void)
+{
+    funDigitalWrite(PIN_FAN_ENABLE, FUN_LOW);
+    g_fan.power_enabled = false;
+    g_fan.power_settle_ms = 0u;
+    pwm_set_duty(0);
+}
+
 static void fan_apply_pwm(fix16_t duty, uint32_t delta_ms)
 {
     duty = fix16_clamp(duty, 0, FIX16_ONE);
 
     if (duty <= 0) {
-        funDigitalWrite(PIN_FAN_ENABLE, FUN_LOW);
-        g_fan.power_enabled = false;
-        g_fan.power_settle_ms = 0u;
+        /* Do not implicitly power off here; callers that want a full shutdown
+         * (user 0% setpoint or power loss) must call fan_power_off(). */
         pwm_set_duty(0);
         return;
     }
@@ -2116,148 +2150,64 @@ static fix16_t temp_target_ratio_from_temp(int16_t temp_c_x100)
     }
     int32_t pos = (int32_t)temp_c_x100 - (int32_t)lo; /* 0..span */
     fix16_t frac = fix16_div(fix16_from_int(pos), fix16_from_int(span));
-    fix16_t range = FIX16_ONE - g_fan_min_ratio;
-    return g_fan_min_ratio + fix16_mul(frac, range);
+    return fix16_mul(frac, FIX16_ONE);
 }
 
 /* -------------------------------------------------------------------------- */
-/* Tach & fan state                                                           */
-/* -------------------------------------------------------------------------- */
+/* Tach & fan state
+ * 简化版：每次有新的 period 时直接换算为 RPM 并低通滤波；当一段时间
+ * 没有新脉冲时，将 RPM 视为 0。Tach 线只要曾经有过有效脉冲，就一直
+ * 认为存在，rpm_valid 一经置位后保持为 true。 */
 static void tach_update(uint32_t delta_ms)
 {
     static uint32_t tach_timeout = 0;
-    static uint32_t last_good_rpm = 0u;
-    /* Keep a small history of periods (ticks) for median filtering. */
-    enum { TACH_BUF_N = 5 };
-    static uint16_t period_buf[TACH_BUF_N];
-    static uint8_t  period_len = 0; /* 0..5 */
-
-    /* Candidate RPM that needs short confirmation when far from last_good_rpm */
-    static uint32_t candidate_rpm = 0u;
-    static uint8_t  candidate_score = 0u;
 
     tach_timeout += delta_ms;
 
     if (g_tach.sample_ready) {
         uint16_t period = g_tach.period_ticks;
         g_tach.sample_ready = 0;
-        if (period >= TACH_MIN_VALID_TICKS) {
-            /* Reset timeout on any plausible period to avoid false invalidation. */
+
+        /* 对于显示用途，放宽滤波：只要 period 不为 0 就接受。 */
+        if (period != 0u) {
             tach_timeout = 0;
-            /* Push to history (keep newest at end). */
-            if (period_len < TACH_BUF_N) {
-                period_buf[period_len++] = period;
-            } else {
-                memmove(&period_buf[0], &period_buf[1], (TACH_BUF_N - 1) * sizeof(uint16_t));
-                period_buf[TACH_BUF_N - 1] = period;
-            }
 
-            /* Sort small buffer (n<=5). */
-            uint8_t n = period_len;
-            uint16_t tmp[TACH_BUF_N];
-            for (uint8_t i = 0; i < n; ++i) { tmp[i] = period_buf[i]; }
-            for (uint8_t i = 1; i < n; ++i) {
-                uint16_t key = tmp[i];
-                int8_t j = (int8_t)i - 1;
-                while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; --j; }
-                tmp[j + 1] = key;
-            }
-            /* Trimmed mean: drop min/max when n>=5; else use median/mean fallback. */
-            uint16_t period_est_ticks = 0;
-            if (n >= 5) {
-                uint32_t sum = 0;
-                for (uint8_t i = 1; i < n - 1; ++i) sum += tmp[i];
-                period_est_ticks = (uint16_t)(sum / (uint32_t)(n - 2));
-            } else if (n == 4) {
-                period_est_ticks = (uint16_t)((tmp[1] + tmp[2]) / 2u);
-            } else if (n == 3) {
-                period_est_ticks = tmp[1];
-            } else if (n == 2) {
-                period_est_ticks = (uint16_t)((tmp[0] + tmp[1]) / 2u);
-            } else {
-                period_est_ticks = tmp[0];
-            }
-
-            /* Convert to RPM using estimated period. */
             uint64_t numerator = (uint64_t)FAN_TACH_TIMER_CLOCK_HZ * 60u;
-            uint64_t denominator = (uint64_t)period_est_ticks * FAN_TACH_PULSES_PER_REV;
+            uint64_t denominator = (uint64_t)period * FAN_TACH_PULSES_PER_REV;
             uint32_t rpm = (denominator == 0u) ? 0u : (uint32_t)(numerator / denominator);
             if (rpm > FAN_TACH_MAX_RPM) {
                 rpm = FAN_TACH_MAX_RPM;
             }
 
-            /* Static hard cap to kill extreme spikes */
-            if (rpm > FAN_RPM_GLITCH_UPPER_RPM) {
-                /* Ignore outliers above trusted range */
-            } else {
-                bool accept = false;
-                if (last_good_rpm == 0u) {
-                    accept = (rpm > 0u);
-                } else {
-                    /* Reject sudden unrealistically low reading when commanded speed is above min. */
-                    if (last_good_rpm >= FAN_RPM_GLITCH_MIN_BASE &&
-                        rpm < FAN_RPM_GLITCH_MIN_BASE &&
-                        g_manual_target > g_fan_min_ratio) {
-                        accept = false;
-                    } else {
-                        /* Relative acceptance window */
-                        uint32_t up_lim   = (last_good_rpm * RPM_ACCEPT_UP_PCT) / 100u;
-                        uint32_t down_lim = (last_good_rpm * RPM_ACCEPT_DOWN_PCT) / 100u;
-                        if (rpm >= down_lim && rpm <= up_lim) {
-                            accept = true;
-                            candidate_score = 0u;
-                        } else {
-                            /* Require two consecutive near-equal candidates */
-                            uint32_t near_lo = (rpm * (100u - RPM_CANDIDATE_NEAR_PCT)) / 100u;
-                            uint32_t near_hi = (rpm * (100u + RPM_CANDIDATE_NEAR_PCT)) / 100u;
-                            if (candidate_score > 0u &&
-                                candidate_rpm >= near_lo && candidate_rpm <= near_hi) {
-                                candidate_score++;
-                            } else {
-                                candidate_rpm = rpm;
-                                candidate_score = 1u;
-                            }
-                            if (candidate_score >= 2u) {
-                                accept = true;
-                                candidate_score = 0u;
-                            }
-                        }
-                    }
-                }
+            g_fan.rpm = rpm;
+            g_fan.rpm_valid = true;
+            g_tach_present = true;
+            g_tach.good_period_ticks = period;
 
-                if (accept) {
-                    g_fan.rpm = rpm;
-                    g_fan.rpm_valid = true;
-                    last_good_rpm = rpm;
-                    g_tach.good_period_ticks = period_est_ticks;
-                    /* Smooth for display/logging without affecting peak detection. */
-                    if (g_fan.rpm_smooth == 0u) {
-                        g_fan.rpm_smooth = rpm;
-                    } else {
-                        int32_t diff = (int32_t)rpm - (int32_t)g_fan.rpm_smooth;
-                        g_fan.rpm_smooth = (uint32_t)((int32_t)g_fan.rpm_smooth + (diff >> RPM_LP_SHIFT));
-                    }
-                }
+            /* 低通滤波用于显示/日志 */
+            if (g_fan.rpm_smooth == 0u) {
+                g_fan.rpm_smooth = rpm;
+            } else {
+                int32_t diff = (int32_t)rpm - (int32_t)g_fan.rpm_smooth;
+                g_fan.rpm_smooth =
+                    (uint32_t)((int32_t)g_fan.rpm_smooth + (diff >> RPM_LP_SHIFT));
             }
         }
     }
 
     if (tach_timeout >= FAN_TACH_TIMEOUT_MS) {
         tach_timeout = 0;
-        g_fan.rpm_valid = false;
-        g_fan.rpm = 0u;
-        g_fan.rpm_smooth = 0u;
-        last_good_rpm = 0u;
-        period_len = 0u;
-        candidate_rpm = 0u;
-        candidate_score = 0u;
+        if (g_fan.rpm_valid) {
+            g_fan.rpm = 0u;
+            g_fan.rpm_smooth = 0u;
+        }
     }
 }
 
 static void fan_update(uint32_t delta_ms)
 {
     if (!g_power.vbus_valid) {
-        fan_apply_pwm(0, delta_ms);
+        fan_power_off();
         g_fan.phase = FAN_PHASE_SPINUP;
         g_fan.spinup_timer_ms = 0;
         g_fan.rpm_max = 0u;
@@ -2322,46 +2272,25 @@ static void fan_update(uint32_t delta_ms)
         }
     }
 
-    fix16_t ratio = g_manual_target;
-    fix16_t duty_target;
+    /* 目标占空比：启动时（CALIB）始终全速，其它模式下，Set% 就是 duty%。 */
+    {
+        fix16_t ratio = fix16_clamp(g_manual_target, 0, FIX16_ONE);
 
-    /* When the logical target is 0%, drive the PWM duty to 0 so the fan
-     * power switch can be turned fully off. For any non-zero ratio we still
-     * map into the calibrated [min,max] duty window. */
-    if (ratio <= 0) {
-        duty_target = 0;
-    } else {
-        fix16_t duty_span = FAN_PWM_MAX_DUTY_Q16 - FAN_PWM_MIN_DUTY_Q16;
-        duty_target = FAN_PWM_MIN_DUTY_Q16 + fix16_mul(ratio, duty_span);
-    }
-
-    g_fan.target_duty = duty_target;
-
-    if (g_fan.rpm_valid) {
-        if (ratio > g_fan_min_ratio && g_fan.rpm < FAN_STALL_RPM_THRESHOLD) {
-            g_fan_min_ratio = fix16_clamp(ratio, 0, FIX16_ONE);
-        }
-    }
-
-    if (!g_fan.rpm_valid && g_fan_min_ratio > FAN_DEFAULT_MIN_RATIO_Q16) {
-        g_fan_min_ratio = FAN_DEFAULT_MIN_RATIO_Q16;
-    }
-
-    if (g_fan.phase == FAN_PHASE_SPINUP) {
-        g_fan.spinup_timer_ms += delta_ms;
-
-        /* Spin-up boost phase: for a short window after enabling the fan,
-         * drive a modest fixed duty to help overcome static friction.
-         * A logical 0% target still results in the fan being kept off. */
-        if (duty_target <= 0) {
-            fan_apply_pwm(0, delta_ms);
+        if (g_mode == CONTROL_MODE_CALIB) {
+            g_fan.target_duty = FIX16_ONE;
         } else {
-            fan_apply_pwm(FAN_SPINUP_DUTY_Q16, delta_ms);
+            g_fan.target_duty = ratio;
         }
+    }
 
-        if (g_fan.spinup_timer_ms >= FAN_SPINUP_MS) {
-            g_fan.phase = FAN_PHASE_RUN;
-        }
+    /* 应用占空比：
+     * - Set 0%：完全断电；
+     * - Set 100% 或 CALIB：直接满占空比；
+     * - 其它：用固定步进做平滑斜坡。 */
+    if (g_fan.target_duty <= 0) {
+        fan_power_off();
+    } else if (g_fan.target_duty >= FIX16_ONE) {
+        fan_apply_pwm(FIX16_ONE, delta_ms);
     } else {
         fix16_t delta = g_fan.target_duty - g_fan.current_duty;
         if (delta > FAN_PWM_RAMP_STEP_Q16) {
@@ -2411,14 +2340,11 @@ static void fan_update(uint32_t delta_ms)
                 peak = 1u;
             }
 
-            fix16_t ratio_100rpm = fix16_div(fix16_from_int(100), fix16_from_int((int32_t)peak));
-            ratio_100rpm = fix16_clamp(ratio_100rpm, 0, FIX16_ONE);
-
-            g_fan_min_ratio = fix16_clamp(ratio_100rpm, FAN_DEFAULT_MIN_RATIO_Q16, FIX16_ONE);
-
             /* Recommended manual target after calibration is the 100 RPM
              * equivalent ratio itself; manual mode is free to go all the way
              * down to 0% if the user desires. */
+            fix16_t ratio_100rpm = fix16_div(fix16_from_int(100), fix16_from_int((int32_t)peak));
+            ratio_100rpm = fix16_clamp(ratio_100rpm, 0, FIX16_ONE);
             g_manual_target = fix16_clamp(ratio_100rpm, 0, FIX16_ONE);
             g_fan_calibration.active = false;
             g_fan_calibration.completed = true;
@@ -2466,7 +2392,7 @@ static void power_update(void)
     if (!g_power.vbus_valid) {
         /* Only on falling edge do we reset fan state and stability tracking. */
         if (prev_vbus) {
-            fan_apply_pwm(0, 0u);
+            fan_power_off();
             g_fan.phase = FAN_PHASE_SPINUP;
             g_fan.spinup_timer_ms = 0;
             g_fan.rpm_max = 0u;
@@ -2649,16 +2575,10 @@ void EXTI7_0_IRQHandler(void)
     uint16_t capture = TIM2->CNT;
     if (g_tach.capture_valid) {
         uint16_t delta = (uint16_t)(capture - g_tach.last_capture);
-        /* Ignore unrealistically short or too-early periods (contact bounce / EMI). */
-        uint16_t min_ticks = TACH_MIN_VALID_TICKS;
-        uint16_t good = g_tach.good_period_ticks;
-        if (good > 0u) {
-            uint32_t adaptive = ((uint32_t)good * TACH_EDGE_MIN_PCT) / 100u;
-            if (adaptive > min_ticks) {
-                min_ticks = (adaptive > 0xFFFFu) ? 0xFFFFu : (uint16_t)adaptive;
-            }
-        }
-        if (delta >= min_ticks) {
+        /* For display-only RPM, accept any non-zero delta as a tach period.
+         * Glitches will be smoothed by rpm_smooth and are preferable to
+         * falsely reporting 0 RPM while the fan is spinning. */
+        if (delta != 0u) {
             g_tach.period_ticks = delta;
             g_tach.sample_ready = 1;
         }

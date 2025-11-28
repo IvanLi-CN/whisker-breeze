@@ -133,7 +133,7 @@ Power sequencing must follow §4.2 of the datasheet: VDD first, then issue `DISP
 ## Operating Parameters
 
 - PWM frequency: 20 kHz nominal (acceptable range 20–30 kHz).
-- Spin-up boost: after `FAN_EN` is asserted, the controller drives a fixed ~20% PWM duty for up to 100 ms to help the fan overcome static friction before handing off to normal duty control.
+- Control loop: closed-loop RPM control using a PID regulator. User-facing percentages map linearly to target RPM; PWM duty is purely the PID output and is not hard-wired to any particular RPM except at 0% (fan fully off) and 100% (full duty).
 - ADC sampling: infrastructure reserved; intended 200 ms cadence when thermal sensing is enabled.
 - UART baud rate: unused.
 - Mode input polarity: active low; confirm pull-ups enabled on PD2/PD3/PD4.
@@ -199,4 +199,4 @@ Notes:
 
 Rationale:
 - Persisting `last_mode` and the last manual target allows predictable startup behavior.
-- Shifting the control band preserves tuning feel while adapting to different ambient baselines.
+- Shifting the control band preserves tuning feel while adapting to different ambient baselines. In AUTO mode this offset affects the linear mapping from temperature into target RPM, which is then tracked by the PID controller.
