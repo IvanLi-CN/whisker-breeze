@@ -279,14 +279,14 @@ static int8_t repeat_steps(bool pressed, uint32_t delta_ms, uint32_t *hold_ms, u
 #define FAN_TACH_TIMER_PRESCALER      479u      /* 48 MHz / (479+1) = 100 kHz */
 #define FAN_TACH_TIMER_CLOCK_HZ       (48000000u / (FAN_TACH_TIMER_PRESCALER + 1u))
 #define FAN_TACH_PULSES_PER_REV       2u
-#define FAN_TACH_MAX_RPM              6000u
+#define FAN_TACH_MAX_RPM              20000u   /* accept high-speed 10k+ RPM fans */
 #define FAN_STALL_RPM_THRESHOLD       50u
 #define FAN_POWER_ON_DELAY_MS         1u
 #define FAN_DEFAULT_MIN_RPM           100u
 #define FAN_DEFAULT_MAX_RPM           20000u
 #define FAN_DEFAULT_MIN_RATIO_Q16     ((fix16_t)((((uint64_t)FAN_DEFAULT_MIN_RPM) << FIX16_FRAC_BITS) / (FAN_DEFAULT_MAX_RPM)))
 #define FAN_RPM_GLITCH_MIN_BASE       300u
-#define FAN_RPM_GLITCH_UPPER_RPM      4500u
+#define FAN_RPM_GLITCH_UPPER_RPM      16000u   /* ignore only absurd spikes, not real 10k RPM */
 
 /* Tach glitch rejection: ignore edges closer than half of the theoretical
  * period at max RPM. Timer runs at FAN_TACH_TIMER_CLOCK_HZ and input has
